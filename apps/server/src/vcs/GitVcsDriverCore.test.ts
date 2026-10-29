@@ -3083,6 +3083,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
     it.effect.each([
       "clean",
       "source-race",
+      "dirty-source",
       "staged",
       "index-flags",
       "different-tree",
@@ -3097,6 +3098,9 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       "partial-copy",
       "unsupported",
       "unsupported-fs",
+      "configured-worktree",
+      "inherited-index",
+      "ref-race",
     ] as const)(
       "reuses large files on macOS without carrying local state through a %s clone",
       (scenario) =>
@@ -3107,14 +3111,35 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           const path = yield* Path.Path;
           const nativePlatform = yield* HostProcess.Platform;
           const name = "assets/large \n雪.bin";
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const setFlags = Effect.fn("test.setCloneSourceFlags")(function* (flags: string) {
+            const child = yield* delegate.spawn(
+              ChildProcess.make("/usr/bin/chflags", [flags, path.join(cwd, name)]),
+            );
+            assert.equal(yield* child.exitCode, 0);
+          }, Effect.scoped);
           const original = "a".repeat(16 * 1024 * 1024);
           yield* writeTextFile(cwd, name, original);
+          yield* fs.utimes(path.join(cwd, name), 1, 1);
+          // Record the protected file's metadata in Git before testing a verified clone.
+          if (scenario === "immutable" && nativePlatform === "darwin") {
+            yield* setFlags("uchg");
+            yield* Effect.addFinalizer(() => setFlags("nouchg").pipe(Effect.ignore));
+          }
           yield* writeTextFile(cwd, ".gitignore", "ignored\n.hook-proof\n");
           yield* git(cwd, ["add", "."]);
           yield* git(cwd, ["commit", "-m", "large asset"]);
           const commit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          let movedCommit: string | null = null;
+          if (scenario === "ref-race") {
+            yield* git(cwd, ["rm", "--cached", "--", name]);
+            yield* git(cwd, ["commit", "-m", "remove asset"]);
+            movedCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+            yield* writeTextFile(cwd, name, "p".repeat(original.length));
+          }
           const changedSource = [
             "source-race",
+            "dirty-source",
             "staged",
             "index-flags",
             "different-tree",
@@ -3122,11 +3147,12 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           ].includes(scenario);
           if (changedSource && scenario !== "source-race") {
             yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
+            if (scenario === "dirty-source") yield* fs.utimes(path.join(cwd, name), 1, 1);
             if (scenario === "fsmonitor")
               yield* git(cwd, ["update-index", "--fsmonitor", "--fsmonitor-valid", "--", name]);
             else if (scenario === "index-flags")
               yield* git(cwd, ["update-index", "--assume-unchanged", "--", name]);
-            else {
+            else if (scenario !== "dirty-source") {
               yield* git(cwd, ["add", "--", name]);
               if (scenario === "different-tree") yield* git(cwd, ["commit", "-m", "another tree"]);
             }
@@ -3146,7 +3172,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           }
           if (scenario === "sparse")
             yield* git(cwd, ["sparse-checkout", "set", "--cone", "assets"]);
-          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          if (scenario === "configured-worktree") {
+            yield* git(cwd, ["config", "core.worktree", cwd]);
+            yield* writeTextFile(cwd, "README.md", "keep local edits\n");
+          }
           if (scenario === "compressed" && nativePlatform === "darwin") {
             const source = path.join(cwd, name);
             const compressed = `${source}.compressed`;
@@ -3161,21 +3190,29 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             assert.equal(code, 0);
             yield* fs.rename(compressed, source);
           }
-          const setFlags = Effect.fn("test.setCloneSourceFlags")(function* (flags: string) {
-            const child = yield* delegate.spawn(
-              ChildProcess.make("/usr/bin/chflags", [flags, path.join(cwd, name)]),
-            );
-            yield* child.exitCode;
-          }, Effect.scoped);
-          if (scenario === "immutable" && nativePlatform === "darwin") {
-            yield* setFlags("uchg");
-            yield* Effect.addFinalizer(() => setFlags("nouchg").pipe(Effect.ignore));
-          }
           const sourceIndex = yield* fs.readFile(path.join(cwd, ".git", "index"));
           let cloneAttempted = false;
           let clonedInode: bigint | undefined;
           const spawner = ChildProcessSpawner.make((command) =>
             Effect.gen(function* () {
+              if (
+                scenario === "ref-race" &&
+                movedCommit &&
+                ChildProcess.isStandardCommand(command) &&
+                command.args.includes("worktree") &&
+                command.args.includes("add")
+              ) {
+                const update = yield* delegate.spawn(
+                  ChildProcess.make("git", [
+                    "-C",
+                    cwd,
+                    "update-ref",
+                    "refs/heads/feature/clone",
+                    movedCommit,
+                  ]),
+                );
+                assert.equal(yield* update.exitCode, 0);
+              }
               if (ChildProcess.isStandardCommand(command) && command.command === "/bin/df") {
                 if (scenario === "unsupported-fs") return makeFailedHandle("not APFS");
                 if (nativePlatform !== "darwin") return makeSuccessfulHandle("");
@@ -3236,12 +3273,36 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             Effect.provide(layerServerConfig),
           );
           const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
-          yield* driver.createWorktree({
-            cwd: path.join(cwd, "assets"),
-            path: worktreePath,
-            refName: scenario === "different-tree" ? commit : initialBranch,
-            newRefName: "feature/clone",
-          });
+          const environment = yield* HostProcess.Environment;
+          yield* driver
+            .createWorktree({
+              cwd: path.join(cwd, "assets"),
+              path: worktreePath,
+              refName:
+                scenario === "different-tree" || scenario === "ref-race" ? commit : initialBranch,
+              newRefName: "feature/clone",
+            })
+            .pipe(
+              Effect.provideService(
+                HostProcess.Environment,
+                scenario === "inherited-index"
+                  ? { ...environment, GIT_INDEX_FILE: path.join(cwd, "foreign-index") }
+                  : environment,
+              ),
+            );
+
+          assert.equal(
+            yield* fs.readFileString(path.join(cwd, "README.md")),
+            scenario === "configured-worktree" ? "keep local edits\n" : "# test\n",
+          );
+
+          if (scenario === "ref-race")
+            assert.isFalse(yield* fs.exists(path.join(worktreePath, name)));
+          else
+            assert.isTrue(
+              (yield* fs.readFileString(path.join(worktreePath, name))) === original,
+              "The worktree must contain the target commit, not local source bytes.",
+            );
 
           assert.equal(
             cloneAttempted,
@@ -3256,6 +3317,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 "post-index-hook",
                 "sparse",
                 "unsupported-fs",
+                "configured-worktree",
+                "inherited-index",
+                "dirty-source",
+                "ref-race",
               ].includes(scenario),
           );
           if (
@@ -3266,7 +3331,6 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             assert.equal(cloned.ino._tag === "Some" ? cloned.ino.value : undefined, clonedInode);
           }
           assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git", "index")), sourceIndex);
-          assert.equal(yield* fs.readFileString(path.join(worktreePath, name)), original);
           assert.equal(yield* git(worktreePath, ["status", "--porcelain"]), "");
           assert.equal(
             yield* fs.exists(path.join(worktreePath, ".hook-proof")),
@@ -3275,6 +3339,13 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           assert.isFalse(yield* fs.exists(path.join(worktreePath, "ignored")));
           assert.isFalse(yield* fs.exists(path.join(worktreePath, "untracked")));
           assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+          if (scenario === "ref-race") {
+            assert.equal(yield* git(worktreePath, ["rev-parse", "HEAD"]), movedCommit);
+            assert.isTrue(
+              (yield* fs.readFileString(path.join(cwd, name))) === "p".repeat(original.length),
+            );
+            return;
+          }
           yield* writeTextFile(worktreePath, name, "c".repeat(original.length));
           assert.equal(
             (yield* driver.execute({

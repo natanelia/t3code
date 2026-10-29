@@ -3935,7 +3935,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           "GitVcsDriver.createWorktree.checkout",
           clonePath,
           ["-c", `checkout.workers=${checkoutWorkers}`, "reset", "--hard", "HEAD"],
-          { ...checkoutOptions, fallbackErrorDetail: "git worktree checkout failed" },
+          {
+            ...checkoutOptions,
+            fallbackErrorDetail: "git worktree checkout failed",
+            env: {
+              ...checkoutOptions.env,
+              GIT_DIR: path.join(clonePath, ".git"),
+              GIT_WORK_TREE: clonePath,
+              GIT_INDEX_FILE: undefined,
+              GIT_COMMON_DIR: undefined,
+            },
+          },
         );
         yield* Effect.annotateCurrentSpan({ worktreeCloned: seeded });
       }).pipe(

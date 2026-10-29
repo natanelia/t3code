@@ -5,7 +5,10 @@ import * as Hex from "effect/encoding/Hex";
 // gitformat-index: only stat fields change; object IDs, modes, paths and the TREE cache stay intact.
 export function withCloneIndexStats(
   index: Uint8Array,
-  clones: ReadonlyMap<string, { readonly oid: string; readonly stat: NodeFS.BigIntStats }>,
+  clones: ReadonlyMap<
+    string,
+    { readonly oid: string; readonly source: NodeFS.BigIntStats; readonly stat: NodeFS.BigIntStats }
+  >,
 ): Uint8Array | null {
   if (index.length < 32 || new TextDecoder().decode(index.subarray(0, 4)) !== "DIRC") return null;
   const bytes = index.slice();
@@ -16,6 +19,7 @@ export function withCloneIndexStats(
   const count = view.getUint32(8);
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const uint32 = (value: bigint) => Number(BigInt.asUintN(32, value));
+  const remaining = new Set(clones.keys());
   let offset = 12;
   for (let entry = 0; entry < count; entry++) {
     if (offset + 62 >= end) return null;
@@ -31,7 +35,27 @@ export function withCloneIndexStats(
       return null;
     }
     const clone = clones.get(name);
-    if (clone && Hex.encode(bytes.subarray(offset + 40, offset + 60)) === clone.oid) {
+    if (clone) {
+      if (Hex.encode(bytes.subarray(offset + 40, offset + 60)) !== clone.oid) return null;
+      remaining.delete(name);
+      const source = clone.source;
+      const sourceFields: ReadonlyArray<readonly [number, bigint]> = [
+        [0, source.ctimeNs / 1_000_000_000n],
+        [4, source.ctimeNs % 1_000_000_000n],
+        [8, source.mtimeNs / 1_000_000_000n],
+        [12, source.mtimeNs % 1_000_000_000n],
+        [16, source.dev],
+        [20, source.ino],
+        [28, source.uid],
+        [32, source.gid],
+        [36, source.size],
+      ];
+      // A successful refresh is not permission to promote a stale or racily smudged source entry.
+      if (
+        view.getUint32(offset + 36) === 0 ||
+        sourceFields.some(([field, value]) => view.getUint32(offset + field) !== uint32(value))
+      )
+        return null;
       const stat = clone.stat;
       view.setUint32(offset, uint32(stat.ctimeNs / 1_000_000_000n));
       view.setUint32(offset + 4, uint32(stat.ctimeNs % 1_000_000_000n));
@@ -45,6 +69,7 @@ export function withCloneIndexStats(
     offset += Math.ceil((nameEnd + 1 - offset) / 8) * 8;
     if (offset > end) return null;
   }
+  if (remaining.size !== 0) return null;
   const parts = [bytes.subarray(0, offset)];
   while (offset < end) {
     if (offset + 8 > end) return null;

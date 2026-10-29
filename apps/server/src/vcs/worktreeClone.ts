@@ -78,6 +78,13 @@ export const planWorktreeClone = Effect.fn("WorktreeClone.plan")(
     ) => Effect.Effect<Effect.Success<ReturnType<typeof readWorktreeCloneFiles>>, GitCommandError>;
   }) {
     if ((yield* HostProcess.Platform) !== "darwin") return null;
+    const environment = yield* HostProcess.Environment;
+    if (
+      ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"].some(
+        (key) => environment[key] !== undefined,
+      )
+    )
+      return null;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const execute = (args: ReadonlyArray<string>, allowNonZeroExit = false) =>
@@ -114,6 +121,7 @@ export const planWorktreeClone = Effect.fn("WorktreeClone.plan")(
     const files = yield* input.filesForTree(treeId);
     if (files === null) return null;
     const root = (yield* execute(["rev-parse", "--show-toplevel"])).stdout.slice(0, -1);
+    const gitDir = (yield* execute(["rev-parse", "--absolute-git-dir"])).stdout.slice(0, -1);
     const hook = (yield* execute([
       "rev-parse",
       "--path-format=absolute",
@@ -123,7 +131,7 @@ export const planWorktreeClone = Effect.fn("WorktreeClone.plan")(
     // Let worktree add own hook invocation, including its zero old-HEAD argument.
     if (yield* fs.exists(path.resolve(root, hook))) return null;
     if (yield* fs.exists(path.join(path.dirname(hook), "post-index-change"))) return null;
-    return { root, files };
+    return { root, gitDir, treeId, files };
   },
   Effect.orElseSucceed(() => null),
 );
@@ -146,6 +154,12 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       operation: "GitVcsDriver.createWorktree.seedClone",
       cwd: worktreePath,
       args,
+      env: {
+        GIT_DIR: path.join(worktreePath, ".git"),
+        GIT_WORK_TREE: worktreePath,
+        GIT_INDEX_FILE: undefined,
+        GIT_COMMON_DIR: undefined,
+      },
       ...options,
     });
   const sourceDevice = (yield* fs.stat(plan.root)).dev;
@@ -164,6 +178,7 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
     Effect.orElseSucceed(() => null),
   );
   if (apfs === null || apfs._tag === "None" || !apfs.value) return false;
+  if ((yield* execute(["rev-parse", "HEAD^{tree}"])).stdout.trim() !== plan.treeId) return false;
   const indexPath = (yield* execute([
     "rev-parse",
     "--path-format=absolute",
@@ -185,7 +200,12 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
         "core.fsmonitor=false",
         ...args,
       ],
-      env: { GIT_INDEX_FILE: indexPath },
+      env: {
+        GIT_DIR: plan.gitDir,
+        GIT_WORK_TREE: plan.root,
+        GIT_INDEX_FILE: indexPath,
+        GIT_COMMON_DIR: undefined,
+      },
       allowNonZeroExit,
       maxOutputBytes: 16 * 1024 * 1024,
     });
@@ -202,6 +222,12 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       operation: "GitVcsDriver.createWorktree.cloneIndexPath",
       cwd: plan.root,
       args: ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+      env: {
+        GIT_DIR: plan.gitDir,
+        GIT_WORK_TREE: plan.root,
+        GIT_INDEX_FILE: undefined,
+        GIT_COMMON_DIR: undefined,
+      },
     })).stdout.slice(0, -1);
     yield* fs.copyFile(sourceIndex, indexPath);
     const sourceIndexBytes = yield* fs.readFile(indexPath);
@@ -215,8 +241,10 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       return yield* unusable;
     const commit = (yield* execute(["rev-parse", "HEAD"])).stdout.trim();
     if (
-      (yield* sourceExecute(["diff-index", "--cached", "--quiet", commit, "--"], true)).exitCode !==
-      0
+      (yield* sourceExecute(
+        ["diff-index", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", commit, "--"],
+        true,
+      )).exitCode !== 0
     )
       return yield* unusable;
     const attributes = (yield* execute(
@@ -277,8 +305,22 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
     }
     if (groups.size === 0) return false;
     // The private index proves the source is clean without trusting assume-unchanged or fsmonitor flags.
-    if ((yield* sourceExecute(["update-index", "-q", "--refresh"], true)).exitCode !== 0)
+    if ((yield* sourceExecute(["update-index", "--refresh"], true)).exitCode !== 0)
       return yield* unusable;
+    const clones = new Map<
+      string,
+      {
+        readonly oid: string;
+        readonly source: NodeFS.BigIntStats;
+        readonly stat: NodeFS.BigIntStats;
+      }
+    >();
+    for (const file of plan.files) {
+      const source = sourceStats.get(file.name);
+      if (source) clones.set(file.name, { oid: file.oid, source, stat: source });
+    }
+    if (withCloneIndexStats(yield* fs.readFile(indexPath), clones) === null) return yield* unusable;
+    clones.clear();
     yield* Effect.forEach(
       groups,
       ([directory, files]) =>
@@ -378,7 +420,6 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
         }),
       { concurrency: 4, discard: true },
     );
-    const clones = new Map<string, { readonly oid: string; readonly stat: NodeFS.BigIntStats }>();
     for (const [name, before] of sourceStats) {
       const after = yield* stat(path.join(plan.root, name));
       const cloned = yield* stat(path.join(worktreePath, name)).pipe(Effect.option);
@@ -397,7 +438,8 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       )
         return yield* unusable;
       const file = filesByName.get(name);
-      if (cloned._tag === "Some" && file) clones.set(name, { oid: file.oid, stat: cloned.value });
+      if (cloned._tag === "Some" && file)
+        clones.set(name, { oid: file.oid, source: before, stat: cloned.value });
     }
     yield* Effect.scoped(
       Effect.gen(function* () {
