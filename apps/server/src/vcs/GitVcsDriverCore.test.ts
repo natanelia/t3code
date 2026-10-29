@@ -3080,6 +3080,287 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
+    it.effect.each([
+      "clean",
+      "source-race",
+      "staged",
+      "index-flags",
+      "different-tree",
+      "v3-index",
+      "v4-index",
+      "split-index",
+      "fsmonitor",
+      "immutable",
+      "compressed",
+      "post-index-hook",
+      "sparse",
+      "partial-copy",
+      "unsupported",
+      "unsupported-fs",
+    ] as const)(
+      "reuses large files on macOS without carrying local state through a %s clone",
+      (scenario) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const nativePlatform = yield* HostProcess.Platform;
+          const name = "assets/large \n雪.bin";
+          const original = "a".repeat(16 * 1024 * 1024);
+          yield* writeTextFile(cwd, name, original);
+          yield* writeTextFile(cwd, ".gitignore", "ignored\n.hook-proof\n");
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "large asset"]);
+          const commit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const changedSource = [
+            "source-race",
+            "staged",
+            "index-flags",
+            "different-tree",
+            "fsmonitor",
+          ].includes(scenario);
+          if (changedSource && scenario !== "source-race") {
+            yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
+            if (scenario === "fsmonitor")
+              yield* git(cwd, ["update-index", "--fsmonitor", "--fsmonitor-valid", "--", name]);
+            else if (scenario === "index-flags")
+              yield* git(cwd, ["update-index", "--assume-unchanged", "--", name]);
+            else {
+              yield* git(cwd, ["add", "--", name]);
+              if (scenario === "different-tree") yield* git(cwd, ["commit", "-m", "another tree"]);
+            }
+          }
+          yield* writeTextFile(cwd, "ignored", "private");
+          yield* writeTextFile(cwd, "untracked", "local");
+          if (scenario === "v3-index" || scenario === "v4-index")
+            yield* git(cwd, ["update-index", `--index-version=${scenario === "v3-index" ? 3 : 4}`]);
+          if (scenario === "split-index") yield* git(cwd, ["update-index", "--split-index"]);
+          if (scenario === "post-index-hook") {
+            yield* writeTextFile(
+              cwd,
+              ".git/hooks/post-index-change",
+              "#!/bin/sh\nprintf invoked > .hook-proof\n",
+            );
+            yield* fs.chmod(path.join(cwd, ".git/hooks/post-index-change"), 0o755);
+          }
+          if (scenario === "sparse")
+            yield* git(cwd, ["sparse-checkout", "set", "--cone", "assets"]);
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          if (scenario === "compressed" && nativePlatform === "darwin") {
+            const source = path.join(cwd, name);
+            const compressed = `${source}.compressed`;
+            const code = yield* Effect.scoped(
+              Effect.gen(function* () {
+                const child = yield* delegate.spawn(
+                  ChildProcess.make("/usr/bin/ditto", ["--hfsCompression", source, compressed]),
+                );
+                return yield* child.exitCode;
+              }),
+            );
+            assert.equal(code, 0);
+            yield* fs.rename(compressed, source);
+          }
+          const setFlags = Effect.fn("test.setCloneSourceFlags")(function* (flags: string) {
+            const child = yield* delegate.spawn(
+              ChildProcess.make("/usr/bin/chflags", [flags, path.join(cwd, name)]),
+            );
+            yield* child.exitCode;
+          }, Effect.scoped);
+          if (scenario === "immutable" && nativePlatform === "darwin") {
+            yield* setFlags("uchg");
+            yield* Effect.addFinalizer(() => setFlags("nouchg").pipe(Effect.ignore));
+          }
+          const sourceIndex = yield* fs.readFile(path.join(cwd, ".git", "index"));
+          let cloneAttempted = false;
+          let clonedInode: bigint | undefined;
+          const spawner = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (ChildProcess.isStandardCommand(command) && command.command === "/bin/df") {
+                if (scenario === "unsupported-fs") return makeFailedHandle("not APFS");
+                if (nativePlatform !== "darwin") return makeSuccessfulHandle("");
+              }
+              if (
+                ChildProcess.isStandardCommand(command) &&
+                command.command === "/usr/bin/stat" &&
+                nativePlatform !== "darwin"
+              )
+                return makeSuccessfulHandle("0\n".repeat(command.args.length - 2));
+              if (
+                ChildProcess.isStandardCommand(command) &&
+                ["/usr/bin/xattr", "/usr/bin/chflags"].includes(command.command) &&
+                nativePlatform !== "darwin"
+              )
+                return makeSuccessfulHandle("");
+              if (!ChildProcess.isStandardCommand(command) || command.command !== "/bin/cp") {
+                return yield* delegate.spawn(command);
+              }
+              cloneAttempted = true;
+              if (scenario === "source-race") {
+                yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
+              }
+              if (scenario === "unsupported") return makeFailedHandle("clone unavailable");
+              let handle;
+              if (nativePlatform === "darwin") handle = yield* delegate.spawn(command);
+              else {
+                const destination = command.args.at(-1)!;
+                for (const source of command.args.slice(1, -1)) {
+                  yield* fs.copyFile(source, path.join(destination, path.basename(source)));
+                }
+                handle = makeSuccessfulHandle("");
+              }
+              return ChildProcessSpawner.makeHandle({
+                ...handle,
+                exitCode: handle.exitCode.pipe(
+                  Effect.tap((code) =>
+                    code === 0
+                      ? fs.stat(path.join(command.args.at(-1)!, path.basename(name))).pipe(
+                          Effect.tap((info) =>
+                            Effect.sync(() => {
+                              clonedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
+                            }),
+                          ),
+                        )
+                      : Effect.void,
+                  ),
+                  Effect.map((code) =>
+                    scenario === "partial-copy" ? ChildProcessSpawner.ExitCode(1) : code,
+                  ),
+                ),
+              });
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
+          yield* driver.createWorktree({
+            cwd: path.join(cwd, "assets"),
+            path: worktreePath,
+            refName: scenario === "different-tree" ? commit : initialBranch,
+            newRefName: "feature/clone",
+          });
+
+          assert.equal(
+            cloneAttempted,
+            !(scenario === "compressed" && nativePlatform === "darwin") &&
+              ![
+                "staged",
+                "index-flags",
+                "different-tree",
+                "v4-index",
+                "split-index",
+                "fsmonitor",
+                "post-index-hook",
+                "sparse",
+                "unsupported-fs",
+              ].includes(scenario),
+          );
+          if (
+            nativePlatform === "darwin" &&
+            ["clean", "v3-index", "immutable"].includes(scenario)
+          ) {
+            const cloned = yield* fs.stat(path.join(worktreePath, name));
+            assert.equal(cloned.ino._tag === "Some" ? cloned.ino.value : undefined, clonedInode);
+          }
+          assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git", "index")), sourceIndex);
+          assert.equal(yield* fs.readFileString(path.join(worktreePath, name)), original);
+          assert.equal(yield* git(worktreePath, ["status", "--porcelain"]), "");
+          assert.equal(
+            yield* fs.exists(path.join(worktreePath, ".hook-proof")),
+            scenario === "post-index-hook",
+          );
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "ignored")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "untracked")));
+          assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+          yield* writeTextFile(worktreePath, name, "c".repeat(original.length));
+          assert.equal(
+            (yield* driver.execute({
+              operation: "test.cloneDirty",
+              cwd: worktreePath,
+              args: ["diff", "--quiet"],
+              allowNonZeroExit: true,
+            })).exitCode,
+            1,
+          );
+          assert.equal(
+            yield* fs.readFileString(path.join(cwd, name)),
+            changedSource ? "b".repeat(original.length) : original,
+          );
+        }),
+    );
+
+    it.effect.each(["cancel", "checkout-error", "existing-path"] as const)(
+      "rolls back only the claimed clone on %s",
+      (scenario) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* writeTextFile(cwd, "large.bin", "a".repeat(16 * 1024 * 1024));
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "large asset"]);
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "rollback");
+          if (scenario === "existing-path")
+            yield* writeTextFile(worktreePath, "keep.txt", "owned elsewhere");
+          const started = yield* Deferred.make<void>();
+          const claimed = yield* Ref.make<string | null>(null);
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make((command) => {
+                if (ChildProcess.isStandardCommand(command)) {
+                  if (command.command === "/bin/df")
+                    return Effect.succeed(makeSuccessfulHandle(""));
+                  if (scenario === "cancel" && command.command === "/bin/cp")
+                    return Effect.succeed(
+                      ChildProcessSpawner.makeHandle({
+                        ...makeSuccessfulHandle(""),
+                        exitCode: Deferred.succeed(started, undefined).pipe(
+                          Effect.andThen(Effect.never),
+                        ),
+                      }),
+                    );
+                  if (scenario === "checkout-error" && command.args.includes("reset"))
+                    return Effect.succeed(makeFailedHandle("checkout failed"));
+                }
+                return delegate.spawn(command);
+              }),
+            ),
+            Effect.provide(layerServerConfig),
+          );
+          const operation = driver.createWorktree(
+            { cwd, path: worktreePath, refName: initialBranch, newRefName: "feature/rollback" },
+            {
+              progress: { onWorktreeClaimed: (value) => Ref.set(claimed, value) },
+            },
+          );
+          if (scenario === "cancel") {
+            const fiber = yield* operation.pipe(Effect.forkChild);
+            const copying = yield* Effect.raceFirst(
+              Deferred.await(started).pipe(Effect.as(true)),
+              Fiber.join(fiber).pipe(Effect.as(false)),
+            );
+            assert.isTrue(copying);
+            assert.equal(yield* Ref.get(claimed), worktreePath);
+            yield* Fiber.interrupt(fiber);
+          } else assert.isTrue(Result.isFailure(yield* operation.pipe(Effect.result)));
+          if (scenario === "existing-path") {
+            assert.isNull(yield* Ref.get(claimed));
+            assert.equal(
+              yield* fs.readFileString(path.join(worktreePath, "keep.txt")),
+              "owned elsewhere",
+            );
+          } else assert.isFalse(yield* fs.exists(worktreePath));
+          assert.notInclude(yield* git(cwd, ["worktree", "list", "--porcelain"]), worktreePath);
+        }),
+    );
+
     it.effect("uses parallel checkout without skipping filters or hooks", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -3087,6 +3368,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "large.bin", "a".repeat(16 * 1024 * 1024));
         yield* git(cwd, ["config", "filter.test.smudge", "sed s/original/filtered/g"]);
         yield* writeTextFile(cwd, ".gitattributes", "asset.txt filter=test\n");
         yield* writeTextFile(cwd, "asset.txt", "original\n");
