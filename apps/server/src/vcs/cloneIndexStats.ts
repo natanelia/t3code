@@ -1,13 +1,14 @@
-// @effect-diagnostics nodeBuiltinImport:off - Git's stat cache needs nanoseconds from BigIntStats, not Effect's millisecond timestamps.
-import type * as NodeFS from "node:fs";
 import * as Hex from "effect/encoding/Hex";
+import type { CloneStat } from "./worktreeCloneNative.ts";
+
+type IndexStat = Pick<CloneStat, "ctimeNs" | "mtimeNs" | "dev" | "ino" | "uid" | "gid" | "size">;
 
 // gitformat-index: only stat fields change; object IDs, modes, paths and the TREE cache stay intact.
 export function withCloneIndexStats(
   index: Uint8Array,
   clones: ReadonlyMap<
     string,
-    { readonly oid: string; readonly source: NodeFS.BigIntStats; readonly stat: NodeFS.BigIntStats }
+    { readonly oid: string; readonly source: IndexStat; readonly stat: IndexStat }
   >,
 ): Uint8Array | null {
   if (index.length < 32 || new TextDecoder().decode(index.subarray(0, 4)) !== "DIRC") return null;

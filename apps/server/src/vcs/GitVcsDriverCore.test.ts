@@ -38,6 +38,8 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { gitConfigEnv } from "./VcsProcess.ts";
+import { WorktreeCloneNative } from "./worktreeCloneNative.ts";
+import { makeNativeCloneForTests } from "./worktreeCloneNative.testkit.ts";
 
 const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitCommandError));
 const decodeVcsRef = Schema.decodeUnknownSync(VcsRef);
@@ -3231,10 +3233,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             yield* fs.rename(compressed, source);
           }
           const sourceIndex = yield* fs.readFile(path.join(cwd, ".git", "index"));
-          const sourceRoot = yield* fs.realPath(cwd);
           const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
           let cloneAttempted = false;
           let clonedInode: bigint | undefined;
+          let sourceRefreshCode: number | undefined;
           const spawner = ChildProcessSpawner.make((command) =>
             Effect.gen(function* () {
               if (
@@ -3260,71 +3262,80 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 if (nativePlatform !== "darwin") return makeSuccessfulHandle("");
               }
               if (
+                nativePlatform !== "darwin" &&
                 ChildProcess.isStandardCommand(command) &&
-                command.command === "/usr/bin/stat" &&
-                nativePlatform !== "darwin"
-              )
-                return makeSuccessfulHandle("0\n".repeat(command.args.length - 2));
-              if (
-                ChildProcess.isStandardCommand(command) &&
-                ["/usr/bin/xattr", "/usr/bin/chflags"].includes(command.command) &&
-                nativePlatform !== "darwin"
+                command.command === "/usr/bin/chflags"
               )
                 return makeSuccessfulHandle("");
-              if (!ChildProcess.isStandardCommand(command) || command.command !== "/bin/cp") {
-                return yield* delegate.spawn(command);
-              }
-              cloneAttempted = true;
-              if (scenario === "directory-race")
-                yield* fs.writeFileString(path.join(cwd, "assets/ignored"), "private");
-              if (scenario === "source-race") {
-                yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
-              }
-              if (scenario === "unsupported") return makeFailedHandle("clone unavailable");
-              let handle;
-              if (nativePlatform === "darwin") handle = yield* delegate.spawn(command);
-              else {
-                const destination = command.args.at(-1)!;
-                for (const source of command.args.slice(1, -1)) {
-                  yield* fs.copy(source, path.join(destination, path.basename(source)), {
-                    preserveTimestamps: true,
-                  });
-                }
-                handle = makeSuccessfulHandle("");
-              }
-              return ChildProcessSpawner.makeHandle({
-                ...handle,
-                exitCode: handle.exitCode.pipe(
-                  Effect.tap((code) =>
-                    code === 0
-                      ? Effect.gen(function* () {
-                          const originalPath = path.join(sourceRoot, name);
-                          const source = command.args
-                            .slice(1, -1)
-                            .find(
-                              (entry) =>
-                                originalPath === entry ||
-                                originalPath.startsWith(`${entry}${path.sep}`),
-                            );
-                          if (!source) return;
-                          const copied = path.join(
-                            command.args.at(-1)!,
-                            path.relative(path.dirname(source), originalPath),
-                          );
-                          const info = yield* fs.stat(copied);
-                          clonedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
-                        })
-                      : Effect.void,
+              const child = yield* delegate.spawn(command);
+              if (
+                ChildProcess.isStandardCommand(command) &&
+                command.args.includes("update-index") &&
+                command.args.includes("--refresh")
+              ) {
+                return ChildProcessSpawner.makeHandle({
+                  ...child,
+                  exitCode: child.exitCode.pipe(
+                    Effect.tap((code) =>
+                      Effect.sync(() => {
+                        sourceRefreshCode = code;
+                      }),
+                    ),
                   ),
-                  Effect.map((code) =>
-                    scenario === "partial-copy" ? ChildProcessSpawner.ExitCode(1) : code,
-                  ),
-                ),
-              });
+                });
+              }
+              return child;
             }),
           );
+          const nativeDelegate = yield* makeNativeCloneForTests();
+          const native = WorktreeCloneNative.of({
+            ...nativeDelegate,
+            clone: (root, destination, names) =>
+              Effect.gen(function* () {
+                cloneAttempted = true;
+                if (scenario === "directory-race")
+                  yield* fs
+                    .writeFileString(path.join(cwd, "assets/ignored"), "private")
+                    .pipe(Effect.orDie);
+                if (scenario === "source-race")
+                  yield* fs
+                    .writeFileString(path.join(cwd, name), "b".repeat(original.length))
+                    .pipe(Effect.orDie);
+                if (scenario === "unsupported")
+                  return yield* new GitCommandError({
+                    operation: "test.clone",
+                    command: "native-clone",
+                    cwd,
+                    detail: "Clone unavailable.",
+                  });
+                yield* nativeDelegate.clone(root, destination, names);
+                const copied = yield* fs.stat(path.join(destination, name)).pipe(
+                  Effect.mapError(
+                    () =>
+                      new GitCommandError({
+                        operation: "test.clone",
+                        command: "native-clone",
+                        cwd,
+                        detail: "Missing copied file.",
+                      }),
+                  ),
+                );
+                clonedInode = copied.ino._tag === "Some" ? copied.ino.value : undefined;
+                assert.isFalse(
+                  yield* fs.exists(path.join(worktreePath, "assets/ignored")).pipe(Effect.orDie),
+                );
+                if (scenario === "partial-copy")
+                  return yield* new GitCommandError({
+                    operation: "test.clone",
+                    command: "native-clone",
+                    cwd,
+                    detail: "Partial copy.",
+                  });
+              }),
+          });
           const driver = yield* makeGitVcsDriverCore().pipe(
             Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(WorktreeCloneNative, native),
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
             Effect.provide(layerServerConfig),
           );
@@ -3359,26 +3370,38 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
               "The worktree must contain the target commit, not local source bytes.",
             );
 
+          if (scenario === "dirty-source") assert.isDefined(sourceRefreshCode);
           assert.equal(
             cloneAttempted,
-            !(scenario === "compressed" && nativePlatform === "darwin") &&
-              ![
-                "staged",
-                "index-flags",
-                "different-tree",
-                "v4-index",
-                "split-index",
-                "fsmonitor",
-                "post-index-hook",
-                "sparse",
-                "unsupported-fs",
-                "configured-worktree",
-                "inherited-index",
-                "dirty-source",
-                "auto-crlf",
-                "ref-race",
-              ].includes(scenario),
+            scenario === "dirty-source"
+              ? sourceRefreshCode === 0
+              : ![
+                  "staged",
+                  "index-flags",
+                  "different-tree",
+                  "v4-index",
+                  "split-index",
+                  "fsmonitor",
+                  "post-index-hook",
+                  "sparse",
+                  "unsupported-fs",
+                  "configured-worktree",
+                  "inherited-index",
+                  "auto-crlf",
+                  "ref-race",
+                ].includes(scenario),
           );
+          // Exact source-cache proofs run on the private copy. Rejected source
+          // bytes must be discarded, not retained through Git's final checkout.
+          if (
+            nativePlatform === "darwin" &&
+            (["compressed", "source-race"].includes(scenario) ||
+              (scenario === "dirty-source" && cloneAttempted))
+          ) {
+            assert.isDefined(clonedInode);
+            const final = yield* fs.stat(path.join(worktreePath, name));
+            assert.notEqual(final.ino._tag === "Some" ? final.ino.value : undefined, clonedInode);
+          }
           if (
             nativePlatform === "darwin" &&
             [
@@ -3472,61 +3495,36 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             yield* git(cwd, ["commit", "-m", "tracked link"]);
             const index = yield* fs.readFile(path.join(cwd, ".git/index"));
             const destination = path.join(yield* makeTmpDir("git-worktrees-"), "links");
-            const sourceRoot = yield* fs.realPath(cwd);
             let attempted = false;
             let copiedInode: bigint | undefined;
-            const spawner = ChildProcessSpawner.make((command) =>
-              Effect.gen(function* () {
-                if (
-                  ChildProcess.isStandardCommand(command) &&
-                  command.command === "/bin/cp" &&
-                  !attempted
-                ) {
+            const nativeDelegate = yield* makeNativeCloneForTests();
+            const native = WorktreeCloneNative.of({
+              ...nativeDelegate,
+              clone: (root, staging, names) =>
+                Effect.gen(function* () {
                   attempted = true;
                   if (scenario === "file-race") {
-                    yield* fs.remove(path.join(cwd, "assets/file.txt"));
-                    yield* fs.symlink(privateFile, path.join(cwd, "assets/file.txt"));
+                    yield* fs.remove(path.join(cwd, "assets/file.txt")).pipe(Effect.orDie);
+                    yield* fs
+                      .symlink(privateFile, path.join(cwd, "assets/file.txt"))
+                      .pipe(Effect.orDie);
                   } else if (scenario === "directory-race") {
-                    yield* fs.rename(path.join(cwd, "assets"), path.join(cwd, "saved-assets"));
-                    yield* fs.symlink(outside, path.join(cwd, "assets"));
+                    yield* fs
+                      .rename(path.join(cwd, "assets"), path.join(cwd, "saved-assets"))
+                      .pipe(Effect.orDie);
+                    yield* fs.symlink(outside, path.join(cwd, "assets")).pipe(Effect.orDie);
                   }
-                }
-                const handle = yield* delegate.spawn(command);
-                if (
-                  scenario !== "clean" ||
-                  !ChildProcess.isStandardCommand(command) ||
-                  command.command !== "/bin/cp"
-                )
-                  return handle;
-                const original = path.join(sourceRoot, "assets/file.txt");
-                const source = command.args
-                  .slice(1, -1)
-                  .find((name) => original === name || original.startsWith(`${name}${path.sep}`));
-                if (!source) return handle;
-                const copied = path.join(
-                  command.args.at(-1)!,
-                  path.relative(path.dirname(source), original),
-                );
-                return ChildProcessSpawner.makeHandle({
-                  ...handle,
-                  exitCode: handle.exitCode.pipe(
-                    Effect.tap((code) =>
-                      code === 0
-                        ? fs.stat(copied).pipe(
-                            Effect.tap((info) =>
-                              Effect.sync(() => {
-                                copiedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
-                              }),
-                            ),
-                          )
-                        : Effect.void,
-                    ),
-                  ),
-                });
-              }),
-            );
+                  yield* nativeDelegate.clone(root, staging, names);
+                  if (scenario === "clean") {
+                    const info = yield* fs
+                      .stat(path.join(staging, "assets/file.txt"))
+                      .pipe(Effect.orDie);
+                    copiedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
+                  }
+                }),
+            });
             const driver = yield* makeGitVcsDriverCore().pipe(
-              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.provideService(WorktreeCloneNative, native),
               Effect.provide(layerServerConfig),
             );
             yield* driver.createWorktree({
@@ -3621,7 +3619,16 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           const started = yield* Deferred.make<void>();
           const claimed = yield* Ref.make<string | null>(null);
           const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const nativeDelegate = yield* makeNativeCloneForTests();
+          const native = WorktreeCloneNative.of({
+            ...nativeDelegate,
+            clone: (root, destination, names) =>
+              scenario === "cancel"
+                ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+                : nativeDelegate.clone(root, destination, names),
+          });
           const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(WorktreeCloneNative, native),
             Effect.provideService(HostProcess.Platform, "darwin"),
             Effect.provideService(
               ChildProcessSpawner.ChildProcessSpawner,
@@ -3629,15 +3636,6 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 if (ChildProcess.isStandardCommand(command)) {
                   if (command.command === "/bin/df")
                     return Effect.succeed(makeSuccessfulHandle(""));
-                  if (scenario === "cancel" && command.command === "/bin/cp")
-                    return Effect.succeed(
-                      ChildProcessSpawner.makeHandle({
-                        ...makeSuccessfulHandle(""),
-                        exitCode: Deferred.succeed(started, undefined).pipe(
-                          Effect.andThen(Effect.never),
-                        ),
-                      }),
-                    );
                   if (scenario === "checkout-error" && command.args.includes("reset"))
                     return Effect.succeed(makeFailedHandle("checkout failed"));
                 }

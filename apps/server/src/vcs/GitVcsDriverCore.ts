@@ -50,6 +50,7 @@ import {
   readWorktreeCloneFiles,
   seedWorktreeClone,
 } from "./worktreeClone.ts";
+import { WorktreeCloneNative, makeWorktreeCloneNative } from "./worktreeCloneNative.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
 import {
   parseRemoteNames,
@@ -941,6 +942,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const { worktreesDir } = yield* ServerConfig.ServerConfig;
   const crypto = yield* Crypto.Crypto;
   const hostPlatform = yield* HostProcess.Platform;
+  const nativeOverride = yield* Effect.serviceOption(WorktreeCloneNative);
+  const nativeClone = Option.isSome(nativeOverride)
+    ? nativeOverride.value
+    : yield* makeWorktreeCloneNative();
   const serviceScope = yield* Effect.scope;
   const statusFetches = new Map<string, Fiber.Fiber<void, GitCommandError>>();
   const statusFetchProcesses = yield* Semaphore.make(4);
@@ -3861,6 +3866,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       cwd: input.cwd,
       refName: targetBranch,
       execute: executeRaw,
+      native: nativeClone,
       filesForTree: (treeId) =>
         Cache.get(worktreeCloneFiles, new WorktreeCloneTreeCacheKey({ cwd: input.cwd, treeId })),
     }).pipe(
@@ -3915,6 +3921,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           plan: clone,
           worktreePath: clonePath,
           execute: executeRaw,
+          native: nativeClone,
         }).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
