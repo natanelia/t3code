@@ -3106,6 +3106,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       "post-index-hook",
       "sparse",
       "partial-copy",
+      "changed-copy",
       "unsupported",
       "unsupported-fs",
       "configured-worktree",
@@ -3324,6 +3325,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 assert.isFalse(
                   yield* fs.exists(path.join(worktreePath, "assets/ignored")).pipe(Effect.orDie),
                 );
+                if (scenario === "changed-copy")
+                  yield* fs
+                    .writeFileString(path.join(destination, name), "bad copy")
+                    .pipe(Effect.orDie);
                 if (scenario === "partial-copy")
                   return yield* new GitCommandError({
                     operation: "test.clone",
@@ -3395,7 +3400,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           // bytes must be discarded, not retained through Git's final checkout.
           if (
             nativePlatform === "darwin" &&
-            (["compressed", "source-race"].includes(scenario) ||
+            (["compressed", "source-race", "changed-copy"].includes(scenario) ||
               (scenario === "dirty-source" && cloneAttempted))
           ) {
             assert.isDefined(clonedInode);

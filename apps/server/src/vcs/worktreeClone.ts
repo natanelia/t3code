@@ -424,33 +424,29 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       for (const { stat } of snapshots.values()) if (!safeFlags(stat)) return yield* unusable;
       yield* native.clone(plan.root, staging, copies);
       const names = [...fileNames, ...snapshots.keys()];
-      const copied = yield* native.inspect(plan.root, names, staging);
+      // Target stats come from normalization below. Inspect only the source here
+      // to avoid reading every copied inode twice.
+      const copied = yield* native.inspect(plan.root, names);
       const metadataChanges: Array<CloneMetadataChange> = [];
       const umask = process.umask();
       for (let i = 0; i < names.length; i++) {
         const name = names[i]!;
-        const [after, target] = copied[i]!;
-        if (after === null || target === null || !safeFlags(after) || !safeFlags(target))
-          return yield* unusable;
+        const [after] = copied[i]!;
+        if (after === null || !safeFlags(after)) return yield* unusable;
         const source = after;
         const file = filesByName.get(name);
         if (file) {
           if (
             source.kind !== (file.symlink ? "symlink" : "file") ||
             source.dev !== BigInt(sourceDevice) ||
-            source.size !== BigInt(file.size) ||
-            target.kind !== source.kind ||
-            (!file.symlink && target.mtimeNs !== source.mtimeNs) ||
-            target.size !== source.size
+            source.size !== BigInt(file.size)
           )
             return yield* unusable;
           sourceStats.set(name, source);
-          clones.set(name, { oid: file.oid, source, stat: target });
-        } else if (
-          !sameCloneSource(snapshots.get(name)!.stat, source) ||
-          target.kind !== "directory"
-        )
-          return yield* unusable;
+          // This first index pass proves only the source. Its output is discarded;
+          // real target fingerprints replace these stats after normalization.
+          clones.set(name, { oid: file.oid, source, stat: source });
+        } else if (!sameCloneSource(snapshots.get(name)!.stat, source)) return yield* unusable;
         const kind = source.kind === "directory" ? "d" : source.kind === "symlink" ? "l" : "f";
         const mode =
           name === "."
@@ -470,6 +466,16 @@ export const seedWorktreeClone = Effect.fn("WorktreeClone.seed")(function* (inpu
       const finalStats = new Map(
         metadataChanges.map((entry, index) => [entry.name, normalized[index]!]),
       );
+      for (const [name, { source }] of clones) {
+        const target = finalStats.get(name);
+        if (
+          target === undefined ||
+          target.kind !== source.kind ||
+          target.size !== source.size ||
+          (source.kind !== "symlink" && target.mtimeNs !== source.mtimeNs)
+        )
+          return yield* unusable;
+      }
       yield* Effect.forEach(
         yield* fs.readDirectory(staging),
         (name) => fs.rename(path.join(staging, name), path.join(worktreePath, name)),

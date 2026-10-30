@@ -70,6 +70,84 @@ it.layer(NodeServices.layer)("macOS native worktree copies", (it) => {
     }),
   );
 
+  it.effect.each(["missing", "directory", "symlink", "duplicate", "missing-root"] as const)(
+    "rejects a %s inventory mismatch before changing any metadata",
+    (scenario) =>
+      Effect.gen(function* () {
+        if ((yield* HostProcess.Platform) !== "darwin") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "native-inventory-shape-" });
+        const stage = path.join(root, "stage");
+        const outside = path.join(root, "outside");
+        yield* fs.makeDirectory(path.join(stage, "nested"), { recursive: true });
+        yield* fs.makeDirectory(outside);
+        yield* fs.writeFileString(path.join(outside, "file"), "private", { mode: 0o600 });
+        yield* fs.writeFileString(path.join(stage, "safe"), "tracked", { mode: 0o600 });
+        const file = path.join(stage, "nested/file");
+        yield* fs.writeFileString(file, "tracked");
+        if (scenario === "missing" || scenario === "directory") yield* fs.remove(file);
+        if (scenario === "directory") {
+          yield* fs.makeDirectory(file);
+          yield* fs.writeFileString(path.join(file, "unexpected"), "private");
+        }
+        if (scenario === "symlink") {
+          yield* fs.remove(path.join(stage, "nested"), { recursive: true });
+          yield* fs.symlink(outside, path.join(stage, "nested"));
+        }
+        const changes = [
+          { name: ".", kind: "d", mode: 0o700 },
+          { name: "safe", kind: "f", mode: 0o644 },
+          { name: "nested", kind: "d", mode: 0o755 },
+          { name: "nested/file", kind: "f", mode: 0o644 },
+        ] as const;
+        const request =
+          scenario === "duplicate"
+            ? [...changes, changes[1]]
+            : scenario === "missing-root"
+              ? changes.slice(1)
+              : changes;
+        const native = yield* makeWorktreeCloneNative();
+        assert.isTrue(
+          Result.isFailure(yield* native.normalize(stage, request).pipe(Effect.result)),
+        );
+        assert.equal((yield* fs.stat(path.join(stage, "safe"))).mode & 0o777, 0o600);
+        assert.equal((yield* fs.stat(path.join(outside, "file"))).mode & 0o777, 0o600);
+        assert.equal(yield* fs.readFileString(path.join(outside, "file")), "private");
+      }),
+  );
+
+  it.effect("removes inherited attributes when their names exceed the small native buffer", () =>
+    Effect.gen(function* () {
+      if ((yield* HostProcess.Platform) !== "darwin") return;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "native-attributes-" });
+      const file = path.join(root, "file");
+      yield* fs.writeFileString(file, "tracked");
+      const names = Array.from(
+        { length: 48 },
+        (_, index) => `com.t3code.private.${index}.${"x".repeat(80)}`,
+      );
+      yield* Effect.forEach(
+        names,
+        (name) =>
+          xattr(["-w", name, "private", file]).pipe(
+            Effect.tap((result) => Effect.sync(() => assert.equal(result.code, 0))),
+          ),
+        { concurrency: 8 },
+      );
+      const native = yield* makeWorktreeCloneNative();
+      yield* native.normalize(root, [
+        { name: ".", kind: "d", mode: 0o700 },
+        { name: "file", kind: "f", mode: 0o644 },
+      ]);
+      const remaining = (yield* xattr([file])).output.split("\n");
+      assert.isTrue(names.every((name) => !remaining.includes(name)));
+      assert.equal(yield* fs.readFileString(file), "tracked");
+    }),
+  );
+
   it.effect("breaks source hardlinks when cloning a directory", () =>
     Effect.gen(function* () {
       if ((yield* HostProcess.Platform) !== "darwin") return;
@@ -117,6 +195,9 @@ it.layer(NodeServices.layer)("macOS native worktree copies", (it) => {
       assert.notEqual((yield* xattr(["-p", "com.t3code.private", file])).code, 0);
       assert.deepEqual(yield* xattr(["-px", "com.apple.provenance", file]), before);
       assert.deepEqual(yield* xattr(["-px", "com.apple.provenance", template]), before);
+      const unchanged = yield* native.normalize(stage, changes, target);
+      assert.deepEqual(unchanged[1], first[1]);
+      assert.deepEqual((yield* native.inspect(stage, ["file"]))[0]![0], unchanged[1]);
       yield* fs.remove(template);
       const second = yield* native.normalize(stage, changes, target);
       // macOS may regenerate an origin tag. Without a template the inherited

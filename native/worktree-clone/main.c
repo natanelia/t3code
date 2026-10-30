@@ -4,7 +4,7 @@
 #include <sys/xattr.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fts.h>
+#include <dirent.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
@@ -97,20 +97,26 @@ static int inspect_path(int root, const char *root_path, const char *name, int a
 }
 
 static int remove_attributes(int fd, const char *link_path, int regular_file) {
-    ssize_t size = fd >= 0 ? flistxattr(fd, NULL, 0, 0)
-                           : listxattr(link_path, NULL, 0, XATTR_NOFOLLOW);
-    if (size < 0) return -1;
-    if (!size) return 0;
-    if (size > MAX_INPUT_BYTES) { errno = EOVERFLOW; return -1; }
-    char *names = malloc((size_t)size);
-    if (!names) return -1;
-    ssize_t actual = fd >= 0 ? flistxattr(fd, names, (size_t)size, 0)
-                             : listxattr(link_path, names, (size_t)size, XATTR_NOFOLLOW);
-    if (actual < 0) { free(names); return -1; }
+    char buffer[4096], *allocated = NULL, *names = buffer;
+    ssize_t actual = fd >= 0 ? flistxattr(fd, names, sizeof(buffer), 0)
+                             : listxattr(link_path, names, sizeof(buffer), XATTR_NOFOLLOW);
+    if (actual < 0 && errno == ERANGE) {
+        ssize_t size = fd >= 0 ? flistxattr(fd, NULL, 0, 0)
+                               : listxattr(link_path, NULL, 0, XATTR_NOFOLLOW);
+        if (size < 0) return -1;
+        if (size > MAX_INPUT_BYTES) { errno = EOVERFLOW; return -1; }
+        allocated = malloc(size ? (size_t)size : 1);
+        if (!allocated) return -1;
+        names = allocated;
+        actual = fd >= 0 ? flistxattr(fd, names, (size_t)size, 0)
+                         : listxattr(link_path, names, (size_t)size, XATTR_NOFOLLOW);
+    }
+    if (actual < 0) { free(allocated); return -1; }
+    int changed = 0;
     for (char *name = names; name < names + actual;) {
         size_t remaining = (size_t)(names + actual - name);
         size_t length = strnlen(name, remaining);
-        if (length == remaining) { free(names); errno = EINVAL; return -1; }
+        if (length == remaining) { free(allocated); errno = EINVAL; return -1; }
         // Keep only an OS origin tag byte-identical to the one Git just put on
         // the new worktree's .git file. Never preserve other inherited metadata.
         if (regular_file && default_origin_size > 0 && !strcmp(name, origin_attribute)) {
@@ -123,11 +129,12 @@ static int remove_attributes(int fd, const char *link_path, int regular_file) {
         }
         int result = fd >= 0 ? fremovexattr(fd, name, 0)
                             : removexattr(link_path, name, XATTR_NOFOLLOW);
-        if (result != 0) { free(names); return -1; }
+        if (result != 0) { free(allocated); return -1; }
+        changed = 1;
         name += length + 1;
     }
-    free(names);
-    return 0;
+    free(allocated);
+    return changed;
 }
 
 static int normalize_path(const char *name, const char *kind, const char *permission, struct info *result) {
@@ -148,7 +155,7 @@ static int normalize_path(const char *name, const char *kind, const char *permis
             !S_ISLNK(stat.st_mode) || (stat.st_flags & 0xffff0020u) != 0) { close(parent); return -1; }
         char path[PATH_MAX];
         int ok = full_path(path, root_paths[0], name) == 0 &&
-            (!stat.st_flags || lchflags(path, 0) == 0) && remove_attributes(-1, path, 0) == 0 &&
+            (!stat.st_flags || lchflags(path, 0) == 0) && remove_attributes(-1, path, 0) >= 0 &&
             fstatat(parent, leaf, &result->stat, AT_SYMLINK_NOFOLLOW) == 0;
         close(parent);
         result->present = ok;
@@ -164,9 +171,20 @@ static int normalize_path(const char *name, const char *kind, const char *permis
         !((kind[0] == 'f' && S_ISREG(stat.st_mode)) || (kind[0] == 'd' && S_ISDIR(stat.st_mode)))) {
         close(fd); return -1;
     }
-    int ok = (!stat.st_flags || fchflags(fd, 0) == 0) && remove_attributes(fd, NULL, kind[0] == 'f') == 0 &&
-        (((stat.st_mode & 07777) == mode) || fchmod(fd, (mode_t)mode) == 0) &&
-        fstat(fd, &result->stat) == 0;
+    int changed = stat.st_flags != 0;
+    int ok = !changed || fchflags(fd, 0) == 0;
+    if (ok) {
+        int attributes = remove_attributes(fd, NULL, kind[0] == 'f');
+        ok = attributes >= 0;
+        changed |= attributes > 0;
+    }
+    if (ok && (stat.st_mode & 07777) != mode) {
+        ok = fchmod(fd, (mode_t)mode) == 0;
+        changed = 1;
+    }
+    // Read-only checks do not change Git's stat fields in this private snapshot.
+    result->stat = stat;
+    if (ok && changed) ok = fstat(fd, &result->stat) == 0;
     close(fd);
     result->present = ok;
     return ok ? 0 : -1;
@@ -184,38 +202,97 @@ static int clone_path(const char *name) {
     return result;
 }
 
-static int compare_paths(const void *left, const void *right) {
-    return strcmp(*(const char *const *)left, *(const char *const *)right);
+static int run_workers(void *(*work)(void *)) {
+    pthread_t threads[WORKERS];
+    size_t started = 0;
+    atomic_store(&next_job, 0);
+    for (; started < WORKERS; started++)
+        if (pthread_create(&threads[started], NULL, work, NULL) != 0) { atomic_store(&failed, 1); break; }
+    for (size_t i = 0; i < started; i++) pthread_join(threads[i], NULL);
+    return atomic_load(&failed) ? -1 : 0;
 }
 
-/* Validate the entire private snapshot before touching its metadata. FTS_PHYSICAL
- * does not visit symlink targets, including links outside the checkout. */
-static int verify_snapshot(void) {
-    char **expected = malloc((job_count ? job_count : 1) * sizeof(*expected));
-    char *root = strdup(root_paths[0]);
-    if (!expected || !root) { free(expected); free(root); return -1; }
-    for (size_t i = 0; i < job_count; i++) expected[i] = tokens[i * 3];
-    qsort(expected, job_count, sizeof(*expected), compare_paths);
-    for (size_t i = 1; i < job_count; i++)
-        if (!strcmp(expected[i - 1], expected[i])) { free(expected); free(root); return -1; }
-    char *paths[] = {root, NULL};
-    FTS *tree = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_NOSTAT | FTS_XDEV, NULL);
-    if (!tree) { free(expected); free(root); return -1; }
-    size_t root_length = strlen(root), count = 0;
-    int result = 0;
+struct snapshot_entry { const char *name; char kind; };
+static struct snapshot_entry *snapshot;
+static dev_t snapshot_device;
+static _Atomic size_t snapshot_seen;
+
+static int compare_paths(const void *left, const void *right) {
+    const struct snapshot_entry *a = left, *b = right;
+    return strcmp(a->name, b->name);
+}
+
+static void *inspect_directory(void *unused) {
+    (void)unused;
     for (;;) {
-        errno = 0;
-        FTSENT *entry = fts_read(tree);
-        if (!entry) { if (errno) result = -1; break; }
-        if (entry->fts_info == FTS_DP) continue;
-        if (entry->fts_info == FTS_DNR || entry->fts_info == FTS_ERR || entry->fts_info == FTS_NS) { result = -1; break; }
-        const char *name = entry->fts_level == 0 ? "." : entry->fts_path + root_length + 1;
-        if (!bsearch(&name, expected, job_count, sizeof(*expected), compare_paths)) { result = -1; break; }
-        count++;
+        size_t index = atomic_fetch_add(&next_job, 1);
+        if (index >= job_count || atomic_load(&failed)) break;
+        const struct snapshot_entry *entry = &snapshot[index];
+        if (entry->kind != 'd') continue;
+        int fd = openat(roots[0], entry->name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+        struct stat stat;
+        if (fd < 0 || fstat(fd, &stat) != 0 || stat.st_dev != snapshot_device) {
+            if (fd >= 0) close(fd);
+            atomic_store(&failed, 1); break;
+        }
+        DIR *directory = fdopendir(fd);
+        if (!directory) { close(fd); atomic_store(&failed, 1); break; }
+        while (!atomic_load(&failed)) {
+            errno = 0;
+            struct dirent *child = readdir(directory);
+            if (!child) { if (errno) atomic_store(&failed, 1); break; }
+            if (!strcmp(child->d_name, ".") || !strcmp(child->d_name, "..")) continue;
+            char path[PATH_MAX];
+            int size = !strcmp(entry->name, ".")
+                ? snprintf(path, sizeof(path), "%s", child->d_name)
+                : snprintf(path, sizeof(path), "%s/%s", entry->name, child->d_name);
+            if (size < 0 || size >= (int)sizeof(path)) { atomic_store(&failed, 1); break; }
+            struct snapshot_entry key = {.name = path};
+            const struct snapshot_entry *expected = bsearch(&key, snapshot, job_count,
+                sizeof(*snapshot), compare_paths);
+            char kind = child->d_type == DT_DIR ? 'd' : child->d_type == DT_REG ? 'f'
+                : child->d_type == DT_LNK ? 'l' : '?';
+            if (child->d_type == DT_UNKNOWN) {
+                struct stat info;
+                if (fstatat(fd, child->d_name, &info, AT_SYMLINK_NOFOLLOW) != 0) {
+                    atomic_store(&failed, 1); break;
+                }
+                kind = S_ISDIR(info.st_mode) ? 'd' : S_ISREG(info.st_mode) ? 'f'
+                    : S_ISLNK(info.st_mode) ? 'l' : '?';
+            }
+            if (!expected || kind != expected->kind) { atomic_store(&failed, 1); break; }
+            atomic_fetch_add(&snapshot_seen, 1);
+        }
+        if (closedir(directory) != 0) atomic_store(&failed, 1);
     }
-    if (count != job_count) result = -1;
-    if (fts_close(tree) != 0) result = -1;
-    free(expected); free(root);
+    return NULL;
+}
+
+/* Check every expected directory before metadata workers start. Directory
+ * descriptors never follow links or cross filesystems, and every child must
+ * match the complete expected name/type inventory. */
+static int verify_snapshot(void) {
+    snapshot = malloc((job_count ? job_count : 1) * sizeof(*snapshot));
+    if (!snapshot) return -1;
+    int has_root = 0;
+    for (size_t i = 0; i < job_count; i++) {
+        const char *kind = tokens[i * 3 + 1];
+        if (strlen(kind) != 1 || (kind[0] != 'd' && kind[0] != 'f' && kind[0] != 'l')) {
+            free(snapshot); return -1;
+        }
+        snapshot[i] = (struct snapshot_entry){.name = tokens[i * 3], .kind = kind[0]};
+        if (!strcmp(snapshot[i].name, ".") && snapshot[i].kind == 'd') has_root = 1;
+    }
+    struct stat root;
+    if (!has_root || fstat(roots[0], &root) != 0) { free(snapshot); return -1; }
+    snapshot_device = root.st_dev;
+    qsort(snapshot, job_count, sizeof(*snapshot), compare_paths);
+    for (size_t i = 1; i < job_count; i++)
+        if (!strcmp(snapshot[i - 1].name, snapshot[i].name)) { free(snapshot); return -1; }
+    atomic_store(&snapshot_seen, 1);
+    int result = run_workers(inspect_directory);
+    if (atomic_load(&snapshot_seen) != job_count) result = -1;
+    free(snapshot);
     return result;
 }
 
@@ -313,11 +390,7 @@ int main(int argc, char **argv) {
         results = calloc(job_count ? job_count * 2 : 1, sizeof(*results));
         if (!results) return 1;
     }
-    pthread_t threads[WORKERS];
-    size_t started = 0;
-    for (; started < WORKERS; started++)
-        if (pthread_create(&threads[started], NULL, worker, NULL) != 0) { atomic_store(&failed, 1); break; }
-    for (size_t i = 0; i < started; i++) pthread_join(threads[i], NULL);
+    run_workers(worker);
     if (!atomic_load(&failed) && operation != CLONE) {
         fputs("{\"version\":1,\"stats\":[", stdout);
         for (size_t i = 0; i < job_count; i++) {
