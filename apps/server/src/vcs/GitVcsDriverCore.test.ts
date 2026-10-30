@@ -38,6 +38,8 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { gitConfigEnv } from "./VcsProcess.ts";
+import { WorktreeCloneNative } from "./worktreeCloneNative.ts";
+import { makeNativeCloneForTests } from "./worktreeCloneNative.testkit.ts";
 
 const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitCommandError));
 const decodeVcsRef = Schema.decodeUnknownSync(VcsRef);
@@ -3080,6 +3082,600 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
+    it.effect.each([
+      "clean",
+      "small-files",
+      "many-files",
+      "empty-file",
+      "auto-text",
+      "auto-crlf",
+      "relative-hooks",
+      "nested-untracked",
+      "directory-race",
+      "source-race",
+      "dirty-source",
+      "staged",
+      "index-flags",
+      "different-tree",
+      "v3-index",
+      "v4-index",
+      "split-index",
+      "fsmonitor",
+      "immutable",
+      "compressed",
+      "post-index-hook",
+      "sparse",
+      "partial-copy",
+      "changed-copy",
+      "unsupported",
+      "unsupported-fs",
+      "configured-worktree",
+      "inherited-index",
+      "ref-race",
+    ] as const)(
+      "reuses tracked files on macOS without carrying local state through a %s clone",
+      (scenario) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const nativePlatform = yield* HostProcess.Platform;
+          const name = "assets/large \n雪.bin";
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const setFlags = Effect.fn("test.setCloneSourceFlags")(function* (flags: string) {
+            const child = yield* delegate.spawn(
+              ChildProcess.make("/usr/bin/chflags", [flags, path.join(cwd, name)]),
+            );
+            assert.equal(yield* child.exitCode, 0);
+          }, Effect.scoped);
+          const original =
+            scenario === "empty-file"
+              ? ""
+              : ["small-files", "many-files", "auto-text", "auto-crlf", "relative-hooks"].includes(
+                    scenario,
+                  )
+                ? "tracked text\n".repeat(10)
+                : "a".repeat(16 * 1024 * 1024);
+          yield* writeTextFile(cwd, name, original);
+          yield* fs.utimes(path.join(cwd, name), 1, 1);
+          // Record the protected file's metadata in Git before testing a verified clone.
+          if (scenario === "immutable" && nativePlatform === "darwin") {
+            yield* setFlags("uchg");
+            yield* Effect.addFinalizer(() => setFlags("nouchg").pipe(Effect.ignore));
+          }
+          yield* writeTextFile(cwd, ".gitignore", "ignored\n.hook-proof\n.hooks/\n");
+          if (scenario === "auto-text" || scenario === "auto-crlf")
+            yield* writeTextFile(cwd, ".gitattributes", "* text=auto eol=lf\n");
+          if (scenario === "many-files") {
+            const directory = `src/${"nested-path-".repeat(8)}`;
+            yield* Effect.forEach(
+              Array.from({ length: 4200 }, (_, index) => `${directory}/${index}.txt`),
+              (name) => writeTextFile(cwd, name, "small\n"),
+              { concurrency: 16, discard: true },
+            );
+          }
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "large asset"]);
+          const commit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          if (scenario === "auto-crlf")
+            yield* writeTextFile(cwd, name, original.replaceAll("\n", "\r\n"));
+          if (scenario === "relative-hooks") {
+            yield* git(cwd, ["config", "core.hooksPath", ".hooks"]);
+            yield* writeTextFile(
+              cwd,
+              ".hooks/post-index-change",
+              "#!/bin/sh\nprintf invoked > .hook-proof\n",
+            );
+            yield* fs.chmod(path.join(cwd, ".hooks/post-index-change"), 0o755);
+          }
+          let movedCommit: string | null = null;
+          if (scenario === "ref-race") {
+            yield* git(cwd, ["rm", "--cached", "--", name]);
+            yield* git(cwd, ["commit", "-m", "remove asset"]);
+            movedCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+            yield* writeTextFile(cwd, name, "p".repeat(original.length));
+          }
+          const changedSource = [
+            "source-race",
+            "dirty-source",
+            "staged",
+            "index-flags",
+            "different-tree",
+            "fsmonitor",
+          ].includes(scenario);
+          if (changedSource && scenario !== "source-race") {
+            yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
+            if (scenario === "dirty-source") yield* fs.utimes(path.join(cwd, name), 1, 1);
+            if (scenario === "fsmonitor")
+              yield* git(cwd, ["update-index", "--fsmonitor", "--fsmonitor-valid", "--", name]);
+            else if (scenario === "index-flags")
+              yield* git(cwd, ["update-index", "--assume-unchanged", "--", name]);
+            else if (scenario !== "dirty-source") {
+              yield* git(cwd, ["add", "--", name]);
+              if (scenario === "different-tree") yield* git(cwd, ["commit", "-m", "another tree"]);
+            }
+          }
+          yield* writeTextFile(cwd, "ignored", "private");
+          yield* writeTextFile(cwd, "untracked", "local");
+          if (scenario === "nested-untracked") {
+            yield* writeTextFile(cwd, "assets/ignored", "private");
+            yield* writeTextFile(cwd, "assets/untracked", "local");
+          }
+          if (scenario === "v3-index" || scenario === "v4-index")
+            yield* git(cwd, ["update-index", `--index-version=${scenario === "v3-index" ? 3 : 4}`]);
+          if (scenario === "split-index") yield* git(cwd, ["update-index", "--split-index"]);
+          if (scenario === "post-index-hook") {
+            yield* writeTextFile(
+              cwd,
+              ".git/hooks/post-index-change",
+              "#!/bin/sh\nprintf invoked > .hook-proof\n",
+            );
+            yield* fs.chmod(path.join(cwd, ".git/hooks/post-index-change"), 0o755);
+          }
+          if (scenario === "sparse")
+            yield* git(cwd, ["sparse-checkout", "set", "--cone", "assets"]);
+          if (scenario === "configured-worktree") {
+            yield* git(cwd, ["config", "core.worktree", cwd]);
+            yield* writeTextFile(cwd, "README.md", "keep local edits\n");
+          }
+          if (scenario === "compressed" && nativePlatform === "darwin") {
+            const source = path.join(cwd, name);
+            const compressed = `${source}.compressed`;
+            const code = yield* Effect.scoped(
+              Effect.gen(function* () {
+                const child = yield* delegate.spawn(
+                  ChildProcess.make("/usr/bin/ditto", ["--hfsCompression", source, compressed]),
+                );
+                return yield* child.exitCode;
+              }),
+            );
+            assert.equal(code, 0);
+            yield* fs.rename(compressed, source);
+          }
+          const sourceIndex = yield* fs.readFile(path.join(cwd, ".git", "index"));
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
+          let cloneAttempted = false;
+          let clonedInode: bigint | undefined;
+          let sourceRefreshCode: number | undefined;
+          const spawner = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (
+                scenario === "ref-race" &&
+                movedCommit &&
+                ChildProcess.isStandardCommand(command) &&
+                command.args.includes("worktree") &&
+                command.args.includes("add")
+              ) {
+                const update = yield* delegate.spawn(
+                  ChildProcess.make("git", [
+                    "-C",
+                    cwd,
+                    "update-ref",
+                    "refs/heads/feature/clone",
+                    movedCommit,
+                  ]),
+                );
+                assert.equal(yield* update.exitCode, 0);
+              }
+              if (ChildProcess.isStandardCommand(command) && command.command === "/bin/df") {
+                if (scenario === "unsupported-fs") return makeFailedHandle("not APFS");
+                if (nativePlatform !== "darwin") return makeSuccessfulHandle("");
+              }
+              if (
+                nativePlatform !== "darwin" &&
+                ChildProcess.isStandardCommand(command) &&
+                command.command === "/usr/bin/chflags"
+              )
+                return makeSuccessfulHandle("");
+              const child = yield* delegate.spawn(command);
+              if (
+                ChildProcess.isStandardCommand(command) &&
+                command.args.includes("update-index") &&
+                command.args.includes("--refresh")
+              ) {
+                return ChildProcessSpawner.makeHandle({
+                  ...child,
+                  exitCode: child.exitCode.pipe(
+                    Effect.tap((code) =>
+                      Effect.sync(() => {
+                        sourceRefreshCode = code;
+                      }),
+                    ),
+                  ),
+                });
+              }
+              return child;
+            }),
+          );
+          const nativeDelegate = yield* makeNativeCloneForTests();
+          const native = WorktreeCloneNative.of({
+            ...nativeDelegate,
+            clone: (root, destination, names) =>
+              Effect.gen(function* () {
+                cloneAttempted = true;
+                if (scenario === "directory-race")
+                  yield* fs
+                    .writeFileString(path.join(cwd, "assets/ignored"), "private")
+                    .pipe(Effect.orDie);
+                if (scenario === "source-race")
+                  yield* fs
+                    .writeFileString(path.join(cwd, name), "b".repeat(original.length))
+                    .pipe(Effect.orDie);
+                if (scenario === "unsupported")
+                  return yield* new GitCommandError({
+                    operation: "test.clone",
+                    command: "native-clone",
+                    cwd,
+                    detail: "Clone unavailable.",
+                  });
+                yield* nativeDelegate.clone(root, destination, names);
+                const copied = yield* fs.stat(path.join(destination, name)).pipe(
+                  Effect.mapError(
+                    () =>
+                      new GitCommandError({
+                        operation: "test.clone",
+                        command: "native-clone",
+                        cwd,
+                        detail: "Missing copied file.",
+                      }),
+                  ),
+                );
+                clonedInode = copied.ino._tag === "Some" ? copied.ino.value : undefined;
+                assert.isFalse(
+                  yield* fs.exists(path.join(worktreePath, "assets/ignored")).pipe(Effect.orDie),
+                );
+                if (scenario === "changed-copy")
+                  yield* fs
+                    .writeFileString(path.join(destination, name), "bad copy")
+                    .pipe(Effect.orDie);
+                if (scenario === "partial-copy")
+                  return yield* new GitCommandError({
+                    operation: "test.clone",
+                    command: "native-clone",
+                    cwd,
+                    detail: "Partial copy.",
+                  });
+              }),
+          });
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(WorktreeCloneNative, native),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          const environment = yield* HostProcess.Environment;
+          yield* driver
+            .createWorktree({
+              cwd: path.join(cwd, "assets"),
+              path: worktreePath,
+              refName:
+                scenario === "different-tree" || scenario === "ref-race" ? commit : initialBranch,
+              newRefName: "feature/clone",
+            })
+            .pipe(
+              Effect.provideService(
+                HostProcess.Environment,
+                scenario === "inherited-index"
+                  ? { ...environment, GIT_INDEX_FILE: path.join(cwd, "foreign-index") }
+                  : environment,
+              ),
+            );
+
+          assert.equal(
+            yield* fs.readFileString(path.join(cwd, "README.md")),
+            scenario === "configured-worktree" ? "keep local edits\n" : "# test\n",
+          );
+
+          if (scenario === "ref-race")
+            assert.isFalse(yield* fs.exists(path.join(worktreePath, name)));
+          else
+            assert.isTrue(
+              (yield* fs.readFileString(path.join(worktreePath, name))) === original,
+              "The worktree must contain the target commit, not local source bytes.",
+            );
+
+          if (scenario === "dirty-source") assert.isDefined(sourceRefreshCode);
+          assert.equal(
+            cloneAttempted,
+            scenario === "dirty-source"
+              ? sourceRefreshCode === 0
+              : ![
+                  "staged",
+                  "index-flags",
+                  "different-tree",
+                  "v4-index",
+                  "split-index",
+                  "fsmonitor",
+                  "post-index-hook",
+                  "sparse",
+                  "unsupported-fs",
+                  "configured-worktree",
+                  "inherited-index",
+                  "auto-crlf",
+                  "ref-race",
+                ].includes(scenario),
+          );
+          // Exact source-cache proofs run on the private copy. Rejected source
+          // bytes must be discarded, not retained through Git's final checkout.
+          if (
+            nativePlatform === "darwin" &&
+            (["compressed", "source-race", "changed-copy"].includes(scenario) ||
+              (scenario === "dirty-source" && cloneAttempted))
+          ) {
+            assert.isDefined(clonedInode);
+            const final = yield* fs.stat(path.join(worktreePath, name));
+            assert.notEqual(final.ino._tag === "Some" ? final.ino.value : undefined, clonedInode);
+          }
+          if (
+            nativePlatform === "darwin" &&
+            [
+              "clean",
+              "small-files",
+              "many-files",
+              "empty-file",
+              "auto-text",
+              "relative-hooks",
+              "nested-untracked",
+              "v3-index",
+              "immutable",
+            ].includes(scenario)
+          ) {
+            const cloned = yield* fs.stat(path.join(worktreePath, name));
+            assert.equal(cloned.ino._tag === "Some" ? cloned.ino.value : undefined, clonedInode);
+          }
+          assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git", "index")), sourceIndex);
+          assert.equal(yield* git(worktreePath, ["status", "--porcelain"]), "");
+          assert.equal(
+            yield* fs.exists(path.join(worktreePath, ".hook-proof")),
+            scenario === "post-index-hook",
+          );
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "ignored")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "untracked")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "assets/ignored")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "assets/untracked")));
+          if (scenario === "relative-hooks")
+            assert.isFalse(yield* fs.exists(path.join(cwd, ".hook-proof")));
+          assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+          if (scenario === "ref-race") {
+            assert.equal(yield* git(worktreePath, ["rev-parse", "HEAD"]), movedCommit);
+            assert.isTrue(
+              (yield* fs.readFileString(path.join(cwd, name))) === "p".repeat(original.length),
+            );
+            return;
+          }
+          yield* writeTextFile(worktreePath, name, "c".repeat(Math.max(1, original.length)));
+          assert.equal(
+            (yield* driver.execute({
+              operation: "test.cloneDirty",
+              cwd: worktreePath,
+              args: ["diff", "--quiet"],
+              allowNonZeroExit: true,
+            })).exitCode,
+            1,
+          );
+          assert.equal(
+            yield* fs.readFileString(path.join(cwd, name)),
+            changedSource
+              ? "b".repeat(original.length)
+              : scenario === "auto-crlf"
+                ? original.replaceAll("\n", "\r\n")
+                : original,
+          );
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "keeps symlinks without touching their targets, including source replacement races",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const platform = yield* HostProcess.Platform;
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          for (const scenario of ["clean", "file-race", "directory-race"] as const) {
+            const cwd = yield* makeTmpDir();
+            const { initialBranch } = yield* initRepoWithCommit(cwd);
+            const outside = yield* makeTmpDir("git-clone-outside-");
+            const privateFile = path.join(outside, "file.txt");
+            yield* fs.writeFileString(privateFile, "private\n");
+            yield* fs.chmod(privateFile, 0o600);
+            const attribute = "io.t3code.clone-test";
+            const xattr = Effect.fn("test.cloneLinkXattr")(function* (args: ReadonlyArray<string>) {
+              const child = yield* delegate.spawn(ChildProcess.make("/usr/bin/xattr", [...args]));
+              const [code, output] = yield* Effect.all([
+                child.exitCode,
+                Stream.runCollect(Stream.decodeText(child.stdout)),
+              ]);
+              assert.equal(code, 0);
+              return output.join("");
+            }, Effect.scoped);
+            if (platform === "darwin") yield* xattr(["-w", attribute, "keep", privateFile]);
+            const before = yield* Effect.tryPromise(() =>
+              NodeFS.promises.lstat(privateFile, { bigint: true }),
+            );
+            yield* writeTextFile(cwd, "assets/file.txt", "tracked\n");
+            yield* fs.symlink(privateFile, path.join(cwd, "assets/link"));
+            yield* git(cwd, ["add", "."]);
+            yield* git(cwd, ["commit", "-m", "tracked link"]);
+            const index = yield* fs.readFile(path.join(cwd, ".git/index"));
+            const destination = path.join(yield* makeTmpDir("git-worktrees-"), "links");
+            let attempted = false;
+            let copiedInode: bigint | undefined;
+            const nativeDelegate = yield* makeNativeCloneForTests();
+            const native = WorktreeCloneNative.of({
+              ...nativeDelegate,
+              clone: (root, staging, names) =>
+                Effect.gen(function* () {
+                  attempted = true;
+                  if (scenario === "file-race") {
+                    yield* fs.remove(path.join(cwd, "assets/file.txt")).pipe(Effect.orDie);
+                    yield* fs
+                      .symlink(privateFile, path.join(cwd, "assets/file.txt"))
+                      .pipe(Effect.orDie);
+                  } else if (scenario === "directory-race") {
+                    yield* fs
+                      .rename(path.join(cwd, "assets"), path.join(cwd, "saved-assets"))
+                      .pipe(Effect.orDie);
+                    yield* fs.symlink(outside, path.join(cwd, "assets")).pipe(Effect.orDie);
+                  }
+                  yield* nativeDelegate.clone(root, staging, names);
+                  if (scenario === "clean") {
+                    const info = yield* fs
+                      .stat(path.join(staging, "assets/file.txt"))
+                      .pipe(Effect.orDie);
+                    copiedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
+                  }
+                }),
+            });
+            const driver = yield* makeGitVcsDriverCore().pipe(
+              Effect.provideService(WorktreeCloneNative, native),
+              Effect.provide(layerServerConfig),
+            );
+            yield* driver.createWorktree({
+              cwd,
+              path: destination,
+              refName: initialBranch,
+              newRefName: `links-${scenario}`,
+            });
+            assert.equal(
+              yield* fs.readFileString(path.join(destination, "assets/file.txt")),
+              "tracked\n",
+            );
+            assert.equal(yield* fs.readLink(path.join(destination, "assets/link")), privateFile);
+            assert.equal(yield* git(destination, ["status", "--porcelain"]), "");
+            assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git/index")), index);
+            assert.equal(yield* fs.readFileString(privateFile), "private\n");
+            const after = yield* Effect.tryPromise(() =>
+              NodeFS.promises.lstat(privateFile, { bigint: true }),
+            );
+            assert.equal(after.mode, before.mode);
+            assert.equal(after.ctimeNs, before.ctimeNs);
+            if (platform === "darwin") {
+              assert.isTrue(attempted);
+              if (scenario === "clean") {
+                const copied = yield* fs.stat(path.join(destination, "assets/file.txt"));
+                assert.equal(
+                  copied.ino._tag === "Some" ? copied.ino.value : undefined,
+                  copiedInode,
+                  "A tracked symlink must not send regular files back through Git checkout",
+                );
+              }
+              assert.equal(yield* xattr(["-p", attribute, privateFile]), "keep\n");
+            }
+          }
+        }),
+    );
+
+    it.effect.each([".hooks", ".HOOKS", ".ignored-hooks"] as const)(
+      "runs checkout hooks like Git with hooksPath=%s",
+      (hooksPath) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = hooksPath === ".ignored-hooks" ? hooksPath : ".hooks";
+          yield* writeTextFile(cwd, ".gitignore", ".hook-proof\n.ignored-hooks/\n");
+          yield* writeTextFile(
+            cwd,
+            `${directory}/post-checkout`,
+            '#!/bin/sh\nprintf "%s\\n" "$@" > .hook-proof\n',
+          );
+          yield* fs.chmod(path.join(cwd, directory, "post-checkout"), 0o755);
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "tracked checkout hook"]);
+          yield* git(cwd, ["config", "core.hooksPath", hooksPath]);
+          const parent = yield* makeTmpDir("git-worktrees-");
+          const baseline = path.join(parent, "baseline");
+          yield* git(cwd, ["worktree", "add", "-b", "hook-baseline", baseline, "HEAD"]);
+          const candidate = path.join(parent, "candidate");
+          yield* (yield* GitVcsDriver.GitVcsDriver).createWorktree({
+            cwd,
+            path: candidate,
+            refName: "HEAD",
+            newRefName: "hook-candidate",
+          });
+          const proof = yield* fs.exists(path.join(baseline, ".hook-proof"));
+          assert.equal(yield* fs.exists(path.join(candidate, ".hook-proof")), proof);
+          if (proof)
+            assert.equal(
+              yield* fs.readFileString(path.join(candidate, ".hook-proof")),
+              yield* fs.readFileString(path.join(baseline, ".hook-proof")),
+            );
+          assert.equal(yield* git(candidate, ["status", "--porcelain"]), "");
+        }),
+    );
+
+    it.effect.each(["cancel", "checkout-error", "existing-path"] as const)(
+      "rolls back only the claimed clone on %s",
+      (scenario) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* writeTextFile(cwd, "large.bin", "a".repeat(16 * 1024 * 1024));
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "large asset"]);
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "rollback");
+          if (scenario === "existing-path")
+            yield* writeTextFile(worktreePath, "keep.txt", "owned elsewhere");
+          const started = yield* Deferred.make<void>();
+          const claimed = yield* Ref.make<string | null>(null);
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const nativeDelegate = yield* makeNativeCloneForTests();
+          const native = WorktreeCloneNative.of({
+            ...nativeDelegate,
+            clone: (root, destination, names) =>
+              scenario === "cancel"
+                ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+                : nativeDelegate.clone(root, destination, names),
+          });
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(WorktreeCloneNative, native),
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make((command) => {
+                if (ChildProcess.isStandardCommand(command)) {
+                  if (command.command === "/bin/df")
+                    return Effect.succeed(makeSuccessfulHandle(""));
+                  if (scenario === "checkout-error" && command.args.includes("reset"))
+                    return Effect.succeed(makeFailedHandle("checkout failed"));
+                }
+                return delegate.spawn(command);
+              }),
+            ),
+            Effect.provide(layerServerConfig),
+          );
+          const operation = driver.createWorktree(
+            { cwd, path: worktreePath, refName: initialBranch, newRefName: "feature/rollback" },
+            {
+              progress: { onWorktreeClaimed: (value) => Ref.set(claimed, value) },
+            },
+          );
+          if (scenario === "cancel") {
+            const fiber = yield* operation.pipe(Effect.forkChild);
+            const copying = yield* Effect.raceFirst(
+              Deferred.await(started).pipe(Effect.as(true)),
+              Fiber.join(fiber).pipe(Effect.as(false)),
+            );
+            assert.isTrue(copying);
+            assert.equal(yield* Ref.get(claimed), worktreePath);
+            yield* Fiber.interrupt(fiber);
+          } else assert.isTrue(Result.isFailure(yield* operation.pipe(Effect.result)));
+          if (scenario === "existing-path") {
+            assert.isNull(yield* Ref.get(claimed));
+            assert.equal(
+              yield* fs.readFileString(path.join(worktreePath, "keep.txt")),
+              "owned elsewhere",
+            );
+          } else assert.isFalse(yield* fs.exists(worktreePath));
+          assert.notInclude(yield* git(cwd, ["worktree", "list", "--porcelain"]), worktreePath);
+        }),
+    );
+
     it.effect("uses parallel checkout without skipping filters or hooks", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -3087,6 +3683,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "large.bin", "a".repeat(16 * 1024 * 1024));
         yield* git(cwd, ["config", "filter.test.smudge", "sed s/original/filtered/g"]);
         yield* writeTextFile(cwd, ".gitattributes", "asset.txt filter=test\n");
         yield* writeTextFile(cwd, "asset.txt", "original\n");

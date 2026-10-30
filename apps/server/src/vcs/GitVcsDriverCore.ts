@@ -44,6 +44,13 @@ import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { removeEmptyDirectory } from "./removeEmptyDirectory.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { removeLinkedWorktree } from "./worktreeRemoval.ts";
+import {
+  clearWorktreeCloneFlags,
+  planWorktreeClone,
+  readWorktreeCloneFiles,
+  seedWorktreeClone,
+} from "./worktreeClone.ts";
+import { WorktreeCloneNative, makeWorktreeCloneNative } from "./worktreeCloneNative.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
 import {
   parseRemoteNames,
@@ -162,6 +169,8 @@ class GitRefsRefreshCacheKey extends Data.Class<{
   gitCommonDir: string;
   generation: number;
 }> {}
+
+class WorktreeCloneTreeCacheKey extends Data.Class<{ cwd: string; treeId: string }> {}
 
 interface GitRepositoryPaths {
   readonly gitCommonDir: string;
@@ -933,6 +942,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const { worktreesDir } = yield* ServerConfig.ServerConfig;
   const crypto = yield* Crypto.Crypto;
   const hostPlatform = yield* HostProcess.Platform;
+  const nativeOverride = yield* Effect.serviceOption(WorktreeCloneNative);
+  const nativeClone = Option.isSome(nativeOverride)
+    ? nativeOverride.value
+    : yield* makeWorktreeCloneNative();
   const serviceScope = yield* Effect.scope;
   const statusFetches = new Map<string, Fiber.Fiber<void, GitCommandError>>();
   const statusFetchProcesses = yield* Semaphore.make(4);
@@ -1075,6 +1088,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ),
         ),
       );
+    },
+  );
+
+  const worktreeCloneFiles = yield* Cache.makeWith(
+    (key: WorktreeCloneTreeCacheKey) =>
+      readWorktreeCloneFiles({ ...key, execute: executeRaw }).pipe(
+        Effect.provideService(Path.Path, path),
+      ),
+    {
+      capacity: 32,
+      timeToLive: Exit.match({
+        onSuccess: () => Duration.minutes(2),
+        onFailure: () => Duration.zero,
+      }),
     },
   );
 
@@ -3835,36 +3862,115 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         "git worktree add failed",
       );
     }
-    const args = ["worktree", "add", "--", worktreePath, input.newRefName ?? input.refName];
+    const clone = yield* planWorktreeClone({
+      cwd: input.cwd,
+      refName: targetBranch,
+      execute: executeRaw,
+      native: nativeClone,
+      filesForTree: (treeId) =>
+        Cache.get(worktreeCloneFiles, new WorktreeCloneTreeCacheKey({ cwd: input.cwd, treeId })),
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.provideService(HostProcess.Platform, hostPlatform),
+    );
+    const args = [
+      "worktree",
+      "add",
+      ...(clone ? ["--no-checkout"] : []),
+      "--",
+      worktreePath,
+      targetBranch,
+    ];
     const progress = options?.progress;
     const onCheckoutProgress = progress?.onCheckoutProgress;
 
     const checkoutWorkers = (yield* readConfigValue(input.cwd, "checkout.workers")) ?? "0";
+    const checkoutOptions: ExecuteGitOptions = {
+      fallbackErrorDetail: "git worktree add failed",
+      timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
+      ...(onCheckoutProgress
+        ? {
+            // Git only prints checkout progress when stderr is a tty or the
+            // delay elapsed. GIT_PROGRESS_DELAY=0 forces it through the pipe.
+            env: { GIT_PROGRESS_DELAY: "0" },
+            progress: {
+              onStderrLine: (line) => {
+                const parsed = parseGitCheckoutProgressLine(line);
+                return parsed ? onCheckoutProgress(parsed) : Effect.void;
+              },
+            },
+          }
+        : {}),
+    };
     yield* executeGitWithStableDiagnostics(
       "GitVcsDriver.createWorktree",
       input.cwd,
       ["-c", `checkout.workers=${checkoutWorkers}`, ...args],
-      {
-        fallbackErrorDetail: "git worktree add failed",
-        timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
-        ...(onCheckoutProgress
-          ? {
-              // Git only prints checkout progress when stderr is a tty or the
-              // delay elapsed. GIT_PROGRESS_DELAY=0 forces it through the pipe.
-              env: { GIT_PROGRESS_DELAY: "0" },
-              progress: {
-                onStderrLine: (line) => {
-                  const parsed = parseGitCheckoutProgressLine(line);
-                  return parsed ? onCheckoutProgress(parsed) : Effect.void;
-                },
-              },
-            }
-          : {}),
-      },
+      checkoutOptions,
     );
 
     if (progress?.onWorktreeClaimed) {
       yield* progress.onWorktreeClaimed(worktreePath);
+    }
+
+    if (clone) {
+      const clonePath = path.resolve(input.cwd, worktreePath);
+      yield* Effect.gen(function* () {
+        const seeded = yield* seedWorktreeClone({
+          plan: clone,
+          worktreePath: clonePath,
+          execute: executeRaw,
+          native: nativeClone,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, commandSpawner),
+          Effect.provideService(Crypto.Crypto, crypto),
+          Effect.mapError(
+            (cause) =>
+              new GitCommandError({
+                operation: "GitVcsDriver.createWorktree",
+                command: "git worktree add",
+                cwd: input.cwd,
+                detail: "Failed to prepare cloned worktree files.",
+                cause,
+              }),
+          ),
+        );
+        yield* executeGitWithStableDiagnostics(
+          "GitVcsDriver.createWorktree.checkout",
+          clonePath,
+          ["-c", `checkout.workers=${checkoutWorkers}`, "reset", "--hard", "HEAD"],
+          {
+            ...checkoutOptions,
+            fallbackErrorDetail: "git worktree checkout failed",
+            env: {
+              ...checkoutOptions.env,
+              GIT_DIR: path.join(clonePath, ".git"),
+              GIT_WORK_TREE: clonePath,
+              GIT_INDEX_FILE: undefined,
+              GIT_COMMON_DIR: undefined,
+            },
+          },
+        );
+        yield* Effect.annotateCurrentSpan({ worktreeCloned: seeded });
+      }).pipe(
+        Effect.onError(() =>
+          clearWorktreeCloneFlags(clonePath).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, commandSpawner),
+            Effect.andThen(
+              runGit(
+                "GitVcsDriver.createWorktree.rollback",
+                input.cwd,
+                ["worktree", "remove", "--force", "--", clonePath],
+                { timeoutMs: WORKTREE_REMOVE_TIMEOUT_MS },
+              ),
+            ),
+            Effect.ignore,
+          ),
+        ),
+      );
     }
 
     // worktree add leaves submodules empty, potentially omitting project skills, tools or source.

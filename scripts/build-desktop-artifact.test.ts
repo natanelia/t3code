@@ -495,6 +495,39 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect("ships the APFS helper outside ASAR only on macOS", () =>
+    Effect.gen(function* () {
+      const resource = { from: "apps/desktop/prod-resources/worktree-clone", to: "worktree-clone" };
+      for (const [platform, target] of [
+        ["mac", "dmg"],
+        ["linux", "AppImage"],
+        ["win", "nsis"],
+      ] as const) {
+        const config = yield* createBuildConfig(
+          platform,
+          target,
+          "0.1.3",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        const resources = Array.isArray(config.extraResources) ? config.extraResources : [];
+        if (platform === "mac") assert.deepInclude(resources, resource);
+        else assert.notDeepInclude(resources, resource);
+      }
+      for (const directory of ["resources", "prod-resources"])
+        assert.isTrue(
+          DESKTOP_FILE_EXCLUSIONS.some((pattern) =>
+            NodePath.matchesGlob(
+              `apps/desktop/${directory}/worktree-clone/t3-worktree-clone`,
+              pattern.slice(1),
+            ),
+          ),
+        );
+    }),
+  );
+
   it.effect("omits update feeds for pull request preview builds", () =>
     Effect.gen(function* () {
       const preview = yield* createBuildConfig(

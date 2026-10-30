@@ -31,6 +31,7 @@ import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-package
 import { signWithJsign } from "./lib/windows-jsign.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
+import { buildWorktreeClone } from "./lib/worktree-clone-build.ts";
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64"]);
@@ -276,7 +277,8 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
         entry.endsWith(".node") ||
         entry.endsWith(".dylib") ||
         entry.endsWith("spawn-helper") ||
-        entry.endsWith("t3-resource-monitor"),
+        entry.endsWith("t3-resource-monitor") ||
+        entry.endsWith("t3-worktree-clone"),
     )
     .map((entry) => path.join(input.contentDir, entry));
 
@@ -464,6 +466,12 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
+  if (input.platform === "mac")
+    yield* buildWorktreeClone({
+      repoRoot,
+      output: path.join(contentDir, "worktree-clone/t3-worktree-clone"),
+      arch: input.arch,
+    });
   yield* stageRuntimeExternals({
     repoRoot,
     stageDir: contentDir,

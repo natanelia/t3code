@@ -12,6 +12,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { DEVELOPMENT_ICON_OVERRIDES } from "../../../scripts/lib/brand-assets.ts";
 import { findEsmImportsOfExternalPackages } from "../../../scripts/lib/cli-executable-imports.ts";
 import { injectLinuxArm64Sea } from "../../../scripts/lib/linux-arm64-sea.ts";
+import { buildWorktreeClone } from "../../../scripts/lib/worktree-clone-build.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -89,6 +90,12 @@ const buildCmd = Command.make(
       );
 
       const webDist = path.join(repoRoot, "apps/web/dist");
+      if ((yield* HostProcess.Platform) === "darwin")
+        yield* buildWorktreeClone({
+          repoRoot,
+          output: path.join(serverDir, "dist/worktree-clone/t3-worktree-clone"),
+          arch: "universal",
+        });
       const clientTarget = path.join(serverDir, "dist/client");
 
       if (yield* fs.exists(webDist)) {
