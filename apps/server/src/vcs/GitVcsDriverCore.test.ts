@@ -3082,6 +3082,14 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   describe("worktree operations", () => {
     it.effect.each([
       "clean",
+      "small-files",
+      "many-files",
+      "empty-file",
+      "auto-text",
+      "auto-crlf",
+      "relative-hooks",
+      "nested-untracked",
+      "directory-race",
       "source-race",
       "dirty-source",
       "staged",
@@ -3102,7 +3110,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       "inherited-index",
       "ref-race",
     ] as const)(
-      "reuses large files on macOS without carrying local state through a %s clone",
+      "reuses tracked files on macOS without carrying local state through a %s clone",
       (scenario) =>
         Effect.gen(function* () {
           const cwd = yield* makeTmpDir();
@@ -3118,7 +3126,14 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             );
             assert.equal(yield* child.exitCode, 0);
           }, Effect.scoped);
-          const original = "a".repeat(16 * 1024 * 1024);
+          const original =
+            scenario === "empty-file"
+              ? ""
+              : ["small-files", "many-files", "auto-text", "auto-crlf", "relative-hooks"].includes(
+                    scenario,
+                  )
+                ? "tracked text\n".repeat(10)
+                : "a".repeat(16 * 1024 * 1024);
           yield* writeTextFile(cwd, name, original);
           yield* fs.utimes(path.join(cwd, name), 1, 1);
           // Record the protected file's metadata in Git before testing a verified clone.
@@ -3126,10 +3141,31 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             yield* setFlags("uchg");
             yield* Effect.addFinalizer(() => setFlags("nouchg").pipe(Effect.ignore));
           }
-          yield* writeTextFile(cwd, ".gitignore", "ignored\n.hook-proof\n");
+          yield* writeTextFile(cwd, ".gitignore", "ignored\n.hook-proof\n.hooks/\n");
+          if (scenario === "auto-text" || scenario === "auto-crlf")
+            yield* writeTextFile(cwd, ".gitattributes", "* text=auto eol=lf\n");
+          if (scenario === "many-files") {
+            const directory = `src/${"nested-path-".repeat(8)}`;
+            yield* Effect.forEach(
+              Array.from({ length: 4200 }, (_, index) => `${directory}/${index}.txt`),
+              (name) => writeTextFile(cwd, name, "small\n"),
+              { concurrency: 16, discard: true },
+            );
+          }
           yield* git(cwd, ["add", "."]);
           yield* git(cwd, ["commit", "-m", "large asset"]);
           const commit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          if (scenario === "auto-crlf")
+            yield* writeTextFile(cwd, name, original.replaceAll("\n", "\r\n"));
+          if (scenario === "relative-hooks") {
+            yield* git(cwd, ["config", "core.hooksPath", ".hooks"]);
+            yield* writeTextFile(
+              cwd,
+              ".hooks/post-index-change",
+              "#!/bin/sh\nprintf invoked > .hook-proof\n",
+            );
+            yield* fs.chmod(path.join(cwd, ".hooks/post-index-change"), 0o755);
+          }
           let movedCommit: string | null = null;
           if (scenario === "ref-race") {
             yield* git(cwd, ["rm", "--cached", "--", name]);
@@ -3159,6 +3195,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           }
           yield* writeTextFile(cwd, "ignored", "private");
           yield* writeTextFile(cwd, "untracked", "local");
+          if (scenario === "nested-untracked") {
+            yield* writeTextFile(cwd, "assets/ignored", "private");
+            yield* writeTextFile(cwd, "assets/untracked", "local");
+          }
           if (scenario === "v3-index" || scenario === "v4-index")
             yield* git(cwd, ["update-index", `--index-version=${scenario === "v3-index" ? 3 : 4}`]);
           if (scenario === "split-index") yield* git(cwd, ["update-index", "--split-index"]);
@@ -3191,6 +3231,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             yield* fs.rename(compressed, source);
           }
           const sourceIndex = yield* fs.readFile(path.join(cwd, ".git", "index"));
+          const sourceRoot = yield* fs.realPath(cwd);
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
           let cloneAttempted = false;
           let clonedInode: bigint | undefined;
           const spawner = ChildProcessSpawner.make((command) =>
@@ -3233,6 +3275,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 return yield* delegate.spawn(command);
               }
               cloneAttempted = true;
+              if (scenario === "directory-race")
+                yield* fs.writeFileString(path.join(cwd, "assets/ignored"), "private");
               if (scenario === "source-race") {
                 yield* fs.writeFileString(path.join(cwd, name), "b".repeat(original.length));
               }
@@ -3242,7 +3286,9 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
               else {
                 const destination = command.args.at(-1)!;
                 for (const source of command.args.slice(1, -1)) {
-                  yield* fs.copyFile(source, path.join(destination, path.basename(source)));
+                  yield* fs.copy(source, path.join(destination, path.basename(source)), {
+                    preserveTimestamps: true,
+                  });
                 }
                 handle = makeSuccessfulHandle("");
               }
@@ -3251,13 +3297,23 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 exitCode: handle.exitCode.pipe(
                   Effect.tap((code) =>
                     code === 0
-                      ? fs.stat(path.join(command.args.at(-1)!, path.basename(name))).pipe(
-                          Effect.tap((info) =>
-                            Effect.sync(() => {
-                              clonedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
-                            }),
-                          ),
-                        )
+                      ? Effect.gen(function* () {
+                          const originalPath = path.join(sourceRoot, name);
+                          const source = command.args
+                            .slice(1, -1)
+                            .find(
+                              (entry) =>
+                                originalPath === entry ||
+                                originalPath.startsWith(`${entry}${path.sep}`),
+                            );
+                          if (!source) return;
+                          const copied = path.join(
+                            command.args.at(-1)!,
+                            path.relative(path.dirname(source), originalPath),
+                          );
+                          const info = yield* fs.stat(copied);
+                          clonedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
+                        })
                       : Effect.void,
                   ),
                   Effect.map((code) =>
@@ -3272,7 +3328,6 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
             Effect.provide(layerServerConfig),
           );
-          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "clone");
           const environment = yield* HostProcess.Environment;
           yield* driver
             .createWorktree({
@@ -3320,12 +3375,23 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
                 "configured-worktree",
                 "inherited-index",
                 "dirty-source",
+                "auto-crlf",
                 "ref-race",
               ].includes(scenario),
           );
           if (
             nativePlatform === "darwin" &&
-            ["clean", "v3-index", "immutable"].includes(scenario)
+            [
+              "clean",
+              "small-files",
+              "many-files",
+              "empty-file",
+              "auto-text",
+              "relative-hooks",
+              "nested-untracked",
+              "v3-index",
+              "immutable",
+            ].includes(scenario)
           ) {
             const cloned = yield* fs.stat(path.join(worktreePath, name));
             assert.equal(cloned.ino._tag === "Some" ? cloned.ino.value : undefined, clonedInode);
@@ -3338,6 +3404,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           );
           assert.isFalse(yield* fs.exists(path.join(worktreePath, "ignored")));
           assert.isFalse(yield* fs.exists(path.join(worktreePath, "untracked")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "assets/ignored")));
+          assert.isFalse(yield* fs.exists(path.join(worktreePath, "assets/untracked")));
+          if (scenario === "relative-hooks")
+            assert.isFalse(yield* fs.exists(path.join(cwd, ".hook-proof")));
           assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
           if (scenario === "ref-race") {
             assert.equal(yield* git(worktreePath, ["rev-parse", "HEAD"]), movedCommit);
@@ -3346,7 +3416,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             );
             return;
           }
-          yield* writeTextFile(worktreePath, name, "c".repeat(original.length));
+          yield* writeTextFile(worktreePath, name, "c".repeat(Math.max(1, original.length)));
           assert.equal(
             (yield* driver.execute({
               operation: "test.cloneDirty",
@@ -3358,8 +3428,179 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           );
           assert.equal(
             yield* fs.readFileString(path.join(cwd, name)),
-            changedSource ? "b".repeat(original.length) : original,
+            changedSource
+              ? "b".repeat(original.length)
+              : scenario === "auto-crlf"
+                ? original.replaceAll("\n", "\r\n")
+                : original,
           );
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "keeps symlinks without touching their targets, including source replacement races",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const platform = yield* HostProcess.Platform;
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          for (const scenario of ["clean", "file-race", "directory-race"] as const) {
+            const cwd = yield* makeTmpDir();
+            const { initialBranch } = yield* initRepoWithCommit(cwd);
+            const outside = yield* makeTmpDir("git-clone-outside-");
+            const privateFile = path.join(outside, "file.txt");
+            yield* fs.writeFileString(privateFile, "private\n");
+            yield* fs.chmod(privateFile, 0o600);
+            const attribute = "io.t3code.clone-test";
+            const xattr = Effect.fn("test.cloneLinkXattr")(function* (args: ReadonlyArray<string>) {
+              const child = yield* delegate.spawn(ChildProcess.make("/usr/bin/xattr", [...args]));
+              const [code, output] = yield* Effect.all([
+                child.exitCode,
+                Stream.runCollect(Stream.decodeText(child.stdout)),
+              ]);
+              assert.equal(code, 0);
+              return output.join("");
+            }, Effect.scoped);
+            if (platform === "darwin") yield* xattr(["-w", attribute, "keep", privateFile]);
+            const before = yield* Effect.tryPromise(() =>
+              NodeFS.promises.lstat(privateFile, { bigint: true }),
+            );
+            yield* writeTextFile(cwd, "assets/file.txt", "tracked\n");
+            yield* fs.symlink(privateFile, path.join(cwd, "assets/link"));
+            yield* git(cwd, ["add", "."]);
+            yield* git(cwd, ["commit", "-m", "tracked link"]);
+            const index = yield* fs.readFile(path.join(cwd, ".git/index"));
+            const destination = path.join(yield* makeTmpDir("git-worktrees-"), "links");
+            const sourceRoot = yield* fs.realPath(cwd);
+            let attempted = false;
+            let copiedInode: bigint | undefined;
+            const spawner = ChildProcessSpawner.make((command) =>
+              Effect.gen(function* () {
+                if (
+                  ChildProcess.isStandardCommand(command) &&
+                  command.command === "/bin/cp" &&
+                  !attempted
+                ) {
+                  attempted = true;
+                  if (scenario === "file-race") {
+                    yield* fs.remove(path.join(cwd, "assets/file.txt"));
+                    yield* fs.symlink(privateFile, path.join(cwd, "assets/file.txt"));
+                  } else if (scenario === "directory-race") {
+                    yield* fs.rename(path.join(cwd, "assets"), path.join(cwd, "saved-assets"));
+                    yield* fs.symlink(outside, path.join(cwd, "assets"));
+                  }
+                }
+                const handle = yield* delegate.spawn(command);
+                if (
+                  scenario !== "clean" ||
+                  !ChildProcess.isStandardCommand(command) ||
+                  command.command !== "/bin/cp"
+                )
+                  return handle;
+                const original = path.join(sourceRoot, "assets/file.txt");
+                const source = command.args
+                  .slice(1, -1)
+                  .find((name) => original === name || original.startsWith(`${name}${path.sep}`));
+                if (!source) return handle;
+                const copied = path.join(
+                  command.args.at(-1)!,
+                  path.relative(path.dirname(source), original),
+                );
+                return ChildProcessSpawner.makeHandle({
+                  ...handle,
+                  exitCode: handle.exitCode.pipe(
+                    Effect.tap((code) =>
+                      code === 0
+                        ? fs.stat(copied).pipe(
+                            Effect.tap((info) =>
+                              Effect.sync(() => {
+                                copiedInode = info.ino._tag === "Some" ? info.ino.value : undefined;
+                              }),
+                            ),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+                });
+              }),
+            );
+            const driver = yield* makeGitVcsDriverCore().pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.provide(layerServerConfig),
+            );
+            yield* driver.createWorktree({
+              cwd,
+              path: destination,
+              refName: initialBranch,
+              newRefName: `links-${scenario}`,
+            });
+            assert.equal(
+              yield* fs.readFileString(path.join(destination, "assets/file.txt")),
+              "tracked\n",
+            );
+            assert.equal(yield* fs.readLink(path.join(destination, "assets/link")), privateFile);
+            assert.equal(yield* git(destination, ["status", "--porcelain"]), "");
+            assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git/index")), index);
+            assert.equal(yield* fs.readFileString(privateFile), "private\n");
+            const after = yield* Effect.tryPromise(() =>
+              NodeFS.promises.lstat(privateFile, { bigint: true }),
+            );
+            assert.equal(after.mode, before.mode);
+            assert.equal(after.ctimeNs, before.ctimeNs);
+            if (platform === "darwin") {
+              assert.isTrue(attempted);
+              if (scenario === "clean") {
+                const copied = yield* fs.stat(path.join(destination, "assets/file.txt"));
+                assert.equal(
+                  copied.ino._tag === "Some" ? copied.ino.value : undefined,
+                  copiedInode,
+                  "A tracked symlink must not send regular files back through Git checkout",
+                );
+              }
+              assert.equal(yield* xattr(["-p", attribute, privateFile]), "keep\n");
+            }
+          }
+        }),
+    );
+
+    it.effect.each([".hooks", ".HOOKS", ".ignored-hooks"] as const)(
+      "runs checkout hooks like Git with hooksPath=%s",
+      (hooksPath) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = hooksPath === ".ignored-hooks" ? hooksPath : ".hooks";
+          yield* writeTextFile(cwd, ".gitignore", ".hook-proof\n.ignored-hooks/\n");
+          yield* writeTextFile(
+            cwd,
+            `${directory}/post-checkout`,
+            '#!/bin/sh\nprintf "%s\\n" "$@" > .hook-proof\n',
+          );
+          yield* fs.chmod(path.join(cwd, directory, "post-checkout"), 0o755);
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "tracked checkout hook"]);
+          yield* git(cwd, ["config", "core.hooksPath", hooksPath]);
+          const parent = yield* makeTmpDir("git-worktrees-");
+          const baseline = path.join(parent, "baseline");
+          yield* git(cwd, ["worktree", "add", "-b", "hook-baseline", baseline, "HEAD"]);
+          const candidate = path.join(parent, "candidate");
+          yield* (yield* GitVcsDriver.GitVcsDriver).createWorktree({
+            cwd,
+            path: candidate,
+            refName: "HEAD",
+            newRefName: "hook-candidate",
+          });
+          const proof = yield* fs.exists(path.join(baseline, ".hook-proof"));
+          assert.equal(yield* fs.exists(path.join(candidate, ".hook-proof")), proof);
+          if (proof)
+            assert.equal(
+              yield* fs.readFileString(path.join(candidate, ".hook-proof")),
+              yield* fs.readFileString(path.join(baseline, ".hook-proof")),
+            );
+          assert.equal(yield* git(candidate, ["status", "--porcelain"]), "");
         }),
     );
 

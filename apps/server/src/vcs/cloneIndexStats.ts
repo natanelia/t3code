@@ -52,7 +52,7 @@ export function withCloneIndexStats(
       ];
       // A successful refresh is not permission to promote a stale or racily smudged source entry.
       if (
-        view.getUint32(offset + 36) === 0 ||
+        (view.getUint32(offset + 36) === 0 && source.size !== 0n) ||
         sourceFields.some(([field, value]) => view.getUint32(offset + field) !== uint32(value))
       )
         return null;
